@@ -1416,6 +1416,48 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over), cb.gpu, slot, si);
 }
 
+namespace {
+
+// compiled shaders kept beside the exe across sessions, by Compile's hash of source, entry point and profile; the
+// version changes when the compile flags or the HLSL generators change in a way the source hash misses
+constexpr uint32_t kShaderCacheVersion = 1;
+
+std::filesystem::path ShaderCachePath(uint64_t hash) {
+    char name[48];
+    std::snprintf(name, sizeof(name), "%016llx_%u.dxbc", (unsigned long long)hash, kShaderCacheVersion);
+    return app::ExeDir() / "shader_cache" / name;
+}
+
+bool LoadCachedShader(uint64_t hash, ComPtr<ID3DBlob>& code) {
+    std::error_code ec;
+    std::filesystem::path path = ShaderCachePath(hash);
+    uintmax_t size = std::filesystem::file_size(path, ec);
+    if (ec || !size || size > (16u << 20)) return false;
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) return false;
+    bool ok = SUCCEEDED(D3DCreateBlob(SIZE_T(size), &code)) &&
+              std::fread(code->GetBufferPointer(), 1, size_t(size), f) == size_t(size);
+    std::fclose(f);
+    if (!ok) code.Reset();
+    return ok;
+}
+
+void SaveCachedShader(uint64_t hash, ID3DBlob* code) {
+    std::error_code ec;
+    std::filesystem::path path = ShaderCachePath(hash);
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::filesystem::path temp = path;
+    temp += L".tmp";
+    FILE* f = _wfopen(temp.c_str(), L"wb");
+    if (!f) return;
+    bool ok = std::fwrite(code->GetBufferPointer(), 1, code->GetBufferSize(), f) == code->GetBufferSize();
+    ok = std::fclose(f) == 0 && ok;
+    if (ok) std::filesystem::rename(temp, path, ec);
+    if (!ok || ec) std::filesystem::remove(temp, ec);
+}
+
+}  // namespace
+
 ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
     // one source can hold several entry points
     uint64_t profile_seed = Hash(profile, std::strlen(profile));
@@ -1426,6 +1468,11 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
     ComPtr<ID3DBlob> code;
     ComPtr<ID3DBlob> err;
     PerfScope perf_compile{g_perf.compile};
+    // compiled before, in this session or an earlier one: D3DCompile is what makes a new effect's first frame hitch
+    if (LoadCachedShader(hash, code)) {
+        blobs_[hash] = code;
+        return code.Get();
+    }
     g_perf.shaders++;
     HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry, profile,
                             D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
@@ -1436,6 +1483,7 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
         return nullptr;
     }
     blobs_[hash] = code;
+    SaveCachedShader(hash, code.Get());
     return code.Get();
 }
 
