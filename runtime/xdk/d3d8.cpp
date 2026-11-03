@@ -667,7 +667,14 @@ HLE_STDCALL(D3DDevice_CopyRects, 5) {
 HLE_STDCALL(D3DDevice_SetViewport, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t v = a[0];
-    g_state.viewport = {R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20)};
+    if (!v) {
+        // later XDKs (5455) take null as the whole render target, which the library's own SetBackBufferScale passes
+        uint32_t w, h;
+        gpu::SurfaceSize(g_state.rt, w, h);
+        g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
+    } else {
+        g_state.viewport = {R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20)};
+    }
     g_state.scissor_count = 0;
     UpdateViewportConstants();
     return 0;
