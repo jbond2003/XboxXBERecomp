@@ -6,6 +6,9 @@ get_filename_component(XBE_SDK_DIR ${CMAKE_CURRENT_LIST_DIR}/.. ABSOLUTE)
 file(TO_NATIVE_PATH "${XBE_SDK_DIR}" XBE_SDK_DIR_NATIVE)
 file(WRITE ${CMAKE_BINARY_DIR}/sdk_dir.txt "${XBE_SDK_DIR_NATIVE}\n")
 
+# builds carry no paths from the builder's PC: source paths in __FILE__ and debug info are relative to the source tree
+add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-ffile-prefix-map=${CMAKE_SOURCE_DIR}/=>)
+
 include(FetchContent)
 set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -119,7 +122,8 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
     target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp)
-    target_link_options(${target} PRIVATE -fuse-ld=lld -g -Wl,/delayload:${target}.dll)
+    # the executable names its PDB without the folder it was built in
+    target_link_options(${target} PRIVATE -fuse-ld=lld -g -Wl,/delayload:${target}.dll -Wl,/pdbaltpath:${target}.pdb)
 
     # without a C runtime: the executable passes on what the code calls
     add_library(${target}_code SHARED ${GEN_SOURCES})
