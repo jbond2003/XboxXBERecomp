@@ -461,9 +461,10 @@ private:
     // what changed since the last command, in 64 byte pieces
     void SendState(const State& s, const std::array<uint32_t, 16>* copied = nullptr) {
         const uint8_t* now = reinterpret_cast<const uint8_t*>(&s);
-        // before this state's bytes: a full palette store waits for the batches before
-        for (size_t i = 0; i < 4; i++)
-            palette_copied_[i] = s.palettes[i] && refilled_.count(s.palettes[i]) ? CopyPalette(s.palettes[i]) : 0;
+        // Every palette is drawn from a copy: the game rewrites many of them (a pool used in turn, by smoke and fire),
+        // and waiting until each one had made it wait once still cost about 20 waits a frame. Before this state's
+        // bytes: a full palette store waits for the batches before.
+        for (size_t i = 0; i < 4; i++) palette_copied_[i] = s.palettes[i] ? CopyPalette(s.palettes[i]) : 0;
         Cmd c{Op::State};
         size_t first = cur_->bytes.size();
         SendSimple(s);
