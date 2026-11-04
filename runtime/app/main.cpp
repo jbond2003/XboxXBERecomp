@@ -224,7 +224,12 @@ void Pace() {
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
     uint32_t cap = Get().fps_cap;
-    if (cap == kFpsCapRefresh) cap = RefreshRate();
+    uint32_t refresh = RefreshRate();
+    if (cap == kFpsCapRefresh) cap = refresh;
+    // with vertical sync on, a cap at or above the refresh rate is the display's own pace: a second, timer based
+    // limiter beside it beats against the real blanks (the mode's whole hertz, 143 or 144 for 143.98, never quite
+    // matches) and repeats or drops a frame every second or so
+    if (Get().vsync && cap && refresh && cap >= refresh) cap = 0;
     auto now = clock::now();
     if (!cap) {
         next = now;
