@@ -406,7 +406,7 @@ static void LogBusyWait(const char* what, uint32_t res, uint32_t esp) {
         if (dispatch::InCode(v)) code[n++] = v;
     }
     if (seen.size() < 64 && seen.insert(uint64_t(res) << 32 | code[0]).second)
-        LOGI("d3d: %s waits on busy %08X (type %05X data %08X), stack %08X %08X %08X %08X", what, res,
+        LOGR("d3d: %s waits on busy %08X (type %05X data %08X), stack %08X %08X %08X %08X", what, res,
              R32(res) & 0x70000, R32(res + 4), code[0], code[1], code[2], code[3]);
 }
 

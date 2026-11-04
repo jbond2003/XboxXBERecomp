@@ -248,8 +248,9 @@ public:
         auto it = last_use_.find(resource);
         if (it == last_use_.end() || done_.load() >= it->second) return;
         // a vertex buffer refilled while draws still read it: later draws read a copy instead
-        if (resource && !(kernel::R32(resource) & 0x70000) && refilled_.insert(resource).second && diag::Perf())
-            LOG_FIRST(32, "render thread: vertex buffer %08X refilled while drawn, its draws read copies now", resource);
+        if (resource && !(kernel::R32(resource) & 0x70000) && refilled_.insert(resource).second && diag::Perf() &&
+            refilled_.size() <= 32)
+            LOGR("render thread: vertex buffer %08X refilled while drawn, its draws read copies now", resource);
         Wait(it->second, WaitFor::Resource, "resource");
     }
 
