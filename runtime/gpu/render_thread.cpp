@@ -40,6 +40,9 @@ constexpr uint32_t kBatchCommands = 64;
 // resource headers the render thread reads: common, data, lock, format, size
 constexpr uint32_t kHeaderBytes = 20, kHeaderSlot = 32;
 constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a copy is renewed after half a ring
+// guest memory for copies of the vertices a draw reads from a buffer the title refills every frame (particles, smoke,
+// fire): the title then refills it without waiting for the draws before, a wait each time in heavy scenes
+constexpr uint32_t kVertexRing = 32u << 20, kVertexParts = 4, kVertexPart = kVertexRing / kVertexParts;
 
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
@@ -119,7 +122,15 @@ public:
 
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
         auto t = PerfStart();
-        SendState(s);
+        std::array<uint32_t, 16> copied{};
+        bool any = false;
+        if (!refilled_.empty()) {
+            for (size_t i = 0; i < s.streams.size(); i++) {
+                const auto& st = s.streams[i];
+                if (st.vb && refilled_.count(st.vb)) any |= (copied[i] = CopyVertices(s, st, start, count, indices)) != 0;
+            }
+        }
+        SendState(s, any ? &copied : nullptr);
         Cmd c{Op::Draw};
         c.a = prim;
         c.b = start;
@@ -131,7 +142,8 @@ public:
         cur_->cmds.push_back(c);
         for (uint32_t tex : s.textures) Use(tex);
         for (uint32_t pal : s.palettes) Use(pal);
-        for (const auto& st : s.streams) Use(st.vb);
+        for (size_t i = 0; i < s.streams.size(); i++)
+            if (!copied[i]) Use(s.streams[i].vb);
         Use(s.rt.header);
         Use(s.zs.header);
         Written(s.rt);
@@ -234,7 +246,11 @@ public:
     }
     void WaitResource(uint32_t resource) override {
         auto it = last_use_.find(resource);
-        if (it != last_use_.end()) Wait(it->second, WaitFor::Resource, "resource");
+        if (it == last_use_.end() || done_.load() >= it->second) return;
+        // a vertex buffer refilled while draws still read it: later draws read a copy instead
+        if (resource && !(kernel::R32(resource) & 0x70000) && refilled_.insert(resource).second && diag::Perf())
+            LOG_FIRST(32, "render thread: vertex buffer %08X refilled while drawn, its draws read copies now", resource);
+        Wait(it->second, WaitFor::Resource, "resource");
     }
 
 private:
@@ -270,6 +286,46 @@ private:
         c.a = data;
         cur_->cmds.push_back(c);
         Wait(Submit(), WaitFor::ReadBack, "read-back");
+    }
+
+    // The vertices this draw reads from a refilled buffer, copied: a header copy pointing at them, 0 to read the buffer
+    uint32_t CopyVertices(const State& s, const State::Stream& st, uint32_t start, uint32_t count, const uint8_t* indices) {
+        if (!st.stride || !count) return 0;
+        uint32_t lo = start, hi = start + count - 1;
+        if (indices) {
+            uint16_t l = 0xFFFF, h = 0;
+            for (uint32_t i = 0; i < count; i++) {
+                uint16_t v;
+                std::memcpy(&v, indices + size_t(i) * 2, 2);
+                l = std::min(l, v);
+                h = std::max(h, v);
+            }
+            lo = l + s.base_vertex;
+            hi = h + s.base_vertex;
+        }
+        uint32_t data = mem::VirtualFromPhysical(kernel::R32(st.vb + 4));
+        uint64_t begin = uint64_t(lo) * st.stride, end = (uint64_t(hi) + 1) * st.stride;
+        end = std::min<uint64_t>(end, mem::AllocationRemaining(data));  // 0 when unknown: the draw reads the buffer
+        if (begin >= end || end - begin > kVertexPart) return 0;
+        if (!vertex_ring_ && !(vertex_ring_ = mem::AllocSystem(kVertexRing, 64))) return 0;
+        uint32_t n = uint32_t((end - begin + 15) & ~uint64_t(15));
+        if (vertex_pos_ % kVertexRing + n > kVertexRing) vertex_pos_ += kVertexRing - vertex_pos_ % kVertexRing;
+        uint32_t at = uint32_t(vertex_pos_ % kVertexRing);
+        // a part is written again once the draws that read its last copies are done
+        for (uint32_t part : {at / kVertexPart, (at + n - 1) / kVertexPart}) {
+            if (part != vertex_part_) {
+                Wait(vertex_use_[part], WaitFor::Copy, "vertex copy");
+                vertex_part_ = part;
+            }
+            vertex_use_[part] = cur_->id;
+        }
+        vertex_pos_ += n;
+        std::memcpy(kernel::HostPtr(vertex_ring_ + at), kernel::HostPtr(data + uint32_t(begin)), size_t(end - begin));
+        uint8_t header[kHeaderBytes] = {};
+        std::memcpy(header, kernel::HostPtr(st.vb), 12);
+        uint32_t moved = vertex_ring_ + at - uint32_t(begin);  // system memory: read as it is, not as physical
+        std::memcpy(header + 4, &moved, 4);
+        return Scratch(header, kHeaderBytes);
     }
 
     // bytes the render thread reads through a guest address, in the header ring
@@ -334,7 +390,7 @@ private:
     }
 
     // what changed since the last command, in 64 byte pieces
-    void SendState(const State& s) {
+    void SendState(const State& s, const std::array<uint32_t, 16>* copied = nullptr) {
         const uint8_t* now = reinterpret_cast<const uint8_t*>(&s);
         Cmd c{Op::State};
         size_t first = cur_->bytes.size();
@@ -347,7 +403,8 @@ private:
         for (size_t i = 0; i < 4; i++) palettes[i] = Header(s.palettes[i]);
         Delta(&sent_.palettes, &palettes, sizeof(palettes));
         auto streams = s.streams;
-        for (auto& st : streams) st.vb = Header(st.vb);
+        for (size_t i = 0; i < streams.size(); i++)
+            streams[i].vb = copied && (*copied)[i] ? (*copied)[i] : Header(streams[i].vb);
         Delta(&sent_.streams, &streams, sizeof(streams));
         Surface rt = s.rt, zs = s.zs;
         rt.header = Header(rt.header);
@@ -494,6 +551,10 @@ private:
     Batch* cur_ = nullptr;
     State sent_;  // the state as the render thread will have it
     std::unordered_map<uint32_t, uint64_t> last_use_;
+    std::unordered_set<uint32_t> refilled_;          // vertex buffers the title waited on, by header
+    uint32_t vertex_ring_ = 0, vertex_part_ = 0;
+    uint64_t vertex_pos_ = 0;
+    std::array<uint64_t, kVertexParts> vertex_use_{};  // the last batch reading copies in each part
     std::unordered_set<uint32_t> written_;  // surfaces drawn since their last read-back, by data address
     std::unordered_set<uint64_t> logged_;   // perf diagnostic: read-backs named once, by address and kind
     uint64_t next_id_ = 0, last_present_ = 0;
