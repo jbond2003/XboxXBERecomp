@@ -396,6 +396,20 @@ HLE_STDCALL(D3DDevice_Release, 0) { return 1; }
 
 // synchronisation, the renderer never runs behind
 
+// perf diagnostic: who waits for the GPU to finish with a buffer, once each per resource and caller
+static void LogBusyWait(const char* what, uint32_t res, uint32_t esp) {
+    if (!diag::Perf() || !g_backend || !g_backend->Busy(res)) return;
+    static std::unordered_set<uint64_t> seen;
+    uint32_t code[4] = {}, n = 0;
+    for (uint32_t i = 0; i < 32 && n < 4; i++) {
+        uint32_t v = R32(esp + i * 4);
+        if (dispatch::InCode(v)) code[n++] = v;
+    }
+    if (seen.size() < 64 && seen.insert(uint64_t(res) << 32 | code[0]).second)
+        LOGI("d3d: %s waits on busy %08X (type %05X data %08X), stack %08X %08X %08X %08X", what, res,
+             R32(res) & 0x70000, R32(res + 4), code[0], code[1], code[2], code[3]);
+}
+
 HLE_STDCALL(D3D_BlockOnResource, 1) {
     uint32_t res = a[0];
     if (res && g_backend) {
@@ -415,6 +429,7 @@ HLE_STDCALL(D3D_BlockOnResource, 1) {
             }
             g_backend->Sync(data, 0);
         } else {
+            LogBusyWait("BlockOnResource", res, ctx.esp);
             g_backend->WaitResource(res);
         }
     }
@@ -433,6 +448,7 @@ HLE_WRAP(Lock2DSurface, 6) {
 HLE_STDCALL(D3DResource_BlockUntilNotBusy, 1) {
     if (a[0] && g_backend) {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
+        LogBusyWait("BlockUntilNotBusy", a[0], ctx.esp);
         g_backend->WaitResource(a[0]);
     }
     gpu::MarkDirty(a[0]);
@@ -443,6 +459,7 @@ HLE_STDCALL(D3DResource_BlockUntilNotBusy, 1) {
 HLE_STDCALL(D3D_BlockOnNonSurfaceResource, 1) {
     if (a[0] && g_backend) {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
+        LogBusyWait("BlockOnNonSurfaceResource", a[0], ctx.esp);
         g_backend->WaitResource(a[0]);
     }
     gpu::MarkDirty(a[0]);
