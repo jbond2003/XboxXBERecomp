@@ -43,6 +43,9 @@ constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a
 // guest memory for copies of the vertices a draw reads from a buffer the title refills every frame (particles, smoke,
 // fire): the title then refills it without waiting for the draws before, a wait each time in heavy scenes
 constexpr uint32_t kVertexRing = 32u << 20, kVertexParts = 4, kVertexPart = kVertexRing / kVertexParts;
+// copies of palettes the title rewrites while drawn, one per distinct set of colours, so the textures decoded with one
+// keep their place in the texture cache
+constexpr uint32_t kPaletteStore = 2u << 20;
 
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
@@ -141,7 +144,8 @@ public:
         }
         cur_->cmds.push_back(c);
         for (uint32_t tex : s.textures) Use(tex);
-        for (uint32_t pal : s.palettes) Use(pal);
+        for (size_t i = 0; i < s.palettes.size(); i++)
+            if (!palette_copied_[i]) Use(s.palettes[i]);
         for (size_t i = 0; i < s.streams.size(); i++)
             if (!copied[i]) Use(s.streams[i].vb);
         Use(s.rt.header);
@@ -248,9 +252,11 @@ public:
         auto it = last_use_.find(resource);
         if (it == last_use_.end() || done_.load() >= it->second) return;
         // a vertex buffer refilled while draws still read it: later draws read a copy instead
-        if (resource && !(kernel::R32(resource) & 0x70000) && refilled_.insert(resource).second && diag::Perf() &&
-            refilled_.size() <= 32)
-            LOGR("render thread: vertex buffer %08X refilled while drawn, its draws read copies now", resource);
+        // a vertex buffer or palette rewritten while draws still read it: later draws read a copy instead
+        uint32_t type = resource ? kernel::R32(resource) & 0x70000 : 1;
+        if ((type == 0 || type == 0x30000) && refilled_.insert(resource).second && diag::Perf() && refilled_.size() <= 32)
+            LOGR("render thread: %s %08X rewritten while drawn, its draws read copies now", type ? "palette" : "vertex buffer",
+                 resource);
         Wait(it->second, WaitFor::Resource, "resource");
     }
 
@@ -329,6 +335,41 @@ private:
         return Scratch(header, kHeaderBytes);
     }
 
+    // A refilled palette's colours, copied once per distinct set: a header copy pointing at them, 0 to read the palette
+    uint32_t CopyPalette(uint32_t header) {
+        uint32_t bytes = (256u >> (kernel::R32(header) >> 30)) * 4;
+        uint32_t data = mem::VirtualFromPhysical(kernel::R32(header + 4));
+        if (mem::AllocationRemaining(data) < bytes) return 0;
+        const uint8_t* colours = static_cast<const uint8_t*>(kernel::HostPtr(data));
+        uint64_t hash = 1469598103934665603ull ^ bytes;
+        for (uint32_t i = 0; i < bytes; i += 4) {
+            uint32_t v;
+            std::memcpy(&v, colours + i, 4);
+            hash = (hash ^ v) * 1099511628211ull;
+        }
+        uint32_t at = 0;
+        auto it = palette_copies_.find(hash);
+        if (it != palette_copies_.end() && !std::memcmp(kernel::HostPtr(it->second), colours, bytes)) {
+            at = it->second;
+        } else {
+            if (!palette_store_ && !(palette_store_ = mem::AllocSystem(kPaletteStore, 64))) return 0;
+            if (palette_used_ + bytes > kPaletteStore) {
+                // full: begun again once no draw reads a copy
+                Wait(Submit(), WaitFor::Copy, "palette copies");
+                palette_copies_.clear();
+                palette_used_ = 0;
+            }
+            at = palette_store_ + palette_used_;
+            palette_used_ += bytes;
+            std::memcpy(kernel::HostPtr(at), colours, bytes);
+            palette_copies_[hash] = at;
+        }
+        uint8_t copy[kHeaderBytes] = {};
+        std::memcpy(copy, kernel::HostPtr(header), 12);
+        std::memcpy(copy + 4, &at, 4);  // system memory: read as it is, not as physical
+        return Scratch(copy, kHeaderBytes);
+    }
+
     // bytes the render thread reads through a guest address, in the header ring
     uint32_t Scratch(const void* p, uint32_t n) {
         uint32_t size = (n + kHeaderSlot - 1) & ~(kHeaderSlot - 1);
@@ -393,6 +434,9 @@ private:
     // what changed since the last command, in 64 byte pieces
     void SendState(const State& s, const std::array<uint32_t, 16>* copied = nullptr) {
         const uint8_t* now = reinterpret_cast<const uint8_t*>(&s);
+        // before this state's bytes: a full palette store waits for the batches before
+        for (size_t i = 0; i < 4; i++)
+            palette_copied_[i] = s.palettes[i] && refilled_.count(s.palettes[i]) ? CopyPalette(s.palettes[i]) : 0;
         Cmd c{Op::State};
         size_t first = cur_->bytes.size();
         SendSimple(s);
@@ -401,7 +445,7 @@ private:
         for (size_t i = 0; i < 4; i++) textures[i] = Header(s.textures[i]);
         Delta(&sent_.textures, &textures, sizeof(textures));
         std::array<uint32_t, 4> palettes;
-        for (size_t i = 0; i < 4; i++) palettes[i] = Header(s.palettes[i]);
+        for (size_t i = 0; i < 4; i++) palettes[i] = palette_copied_[i] ? palette_copied_[i] : Header(s.palettes[i]);
         Delta(&sent_.palettes, &palettes, sizeof(palettes));
         auto streams = s.streams;
         for (size_t i = 0; i < streams.size(); i++)
@@ -552,7 +596,10 @@ private:
     Batch* cur_ = nullptr;
     State sent_;  // the state as the render thread will have it
     std::unordered_map<uint32_t, uint64_t> last_use_;
-    std::unordered_set<uint32_t> refilled_;          // vertex buffers the title waited on, by header
+    std::unordered_set<uint32_t> refilled_;          // vertex buffers and palettes the title waited on, by header
+    std::unordered_map<uint64_t, uint32_t> palette_copies_;  // by the colours' hash
+    uint32_t palette_store_ = 0, palette_used_ = 0;
+    std::array<uint32_t, 4> palette_copied_{};       // the last state sent: its palettes' copies, 0 where none
     uint32_t vertex_ring_ = 0, vertex_part_ = 0;
     uint64_t vertex_pos_ = 0;
     std::array<uint64_t, kVertexParts> vertex_use_{};  // the last batch reading copies in each part
