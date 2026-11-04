@@ -25,6 +25,7 @@
 
 #include "core/diag.h"
 #include "core/log.h"
+#include "core/profiler.h"
 #include "gpu/backend.h"
 #include "gpu/simple_dirty.h"
 #include "kernel/kernel.h"
@@ -204,8 +205,17 @@ public:
         if (diag::Perf()) g_perf_capture_ns.fetch_add(Ns(t), std::memory_order_relaxed);
         // the title records one frame while the one before it draws, on the GPU too: a GPU bound frame rate then paces
         // the game like a frame rate cap, and the frame times the game measures match the frames shown
+        if (!presents_) profiler::AddThisThread("title");
         Wait(last_present_, WaitFor::Frame, nullptr);
-        if (presents_) inner_->WaitGpuFrame(presents_ - 1);
+        if (presents_) {
+            auto gpu = PerfStart();
+            inner_->WaitGpuFrame(presents_ - 1);
+            if (diag::Perf()) {
+                uint64_t ns = Ns(gpu);
+                g_perf_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+                g_perf_wait_kind_ns[size_t(WaitFor::Frame)].fetch_add(ns, std::memory_order_relaxed);
+            }
+        }
         presents_++;
         last_present_ = id;
     }
@@ -518,6 +528,7 @@ private:
         if (auto set = reinterpret_cast<SetDescription>(
                 reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription"))))
             set(GetCurrentThread(), L"render");
+        profiler::AddThisThread("render");
         for (;;) {
             Batch* b;
             {
