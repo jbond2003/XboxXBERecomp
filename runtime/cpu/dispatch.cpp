@@ -8,6 +8,7 @@
 #include <windows.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -113,6 +114,21 @@ void Init() {
     for (const uint32_t* c = g_continuations; *c; c++)
         if (*c >= g_lo && *c < g_hi) g_continuation[*c - g_lo] = true;
     LOGI("dispatch: %zu functions over %08X..%08X", n, g_lo, g_hi);
+}
+
+// the guest function whose recompiled code holds host address pc, 0 if none: the profiler names samples by it
+uint32_t GuestAt(uintptr_t pc) {
+    static std::once_flag once;
+    static std::vector<std::pair<uintptr_t, uint32_t>> starts;
+    std::call_once(once, [] {
+        for (const X86FuncMapping* m = g_mappings; m && m->host; m++)
+            starts.push_back({reinterpret_cast<uintptr_t>(m->host), m->guest});
+        std::sort(starts.begin(), starts.end());
+    });
+    auto it = std::upper_bound(starts.begin(), starts.end(), std::pair<uintptr_t, uint32_t>{pc, 0xFFFFFFFFu});
+    if (it == starts.begin()) return 0;
+    --it;
+    return pc - it->first < (1u << 20) ? it->second : 0;
 }
 
 X86Func* Find(uint32_t guest) {

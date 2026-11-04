@@ -25,6 +25,7 @@
 
 #include "core/diag.h"
 #include "core/log.h"
+#include "core/profiler.h"
 #include "gpu/backend.h"
 #include "gpu/simple_dirty.h"
 #include "kernel/kernel.h"
@@ -40,10 +41,16 @@ constexpr uint32_t kBatchCommands = 64;
 // resource headers the render thread reads: common, data, lock, format, size
 constexpr uint32_t kHeaderBytes = 20, kHeaderSlot = 32;
 constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a copy is renewed after half a ring
+// guest memory for copies of the vertices a draw reads from a buffer the title refills every frame (particles, smoke,
+// fire): the title then refills it without waiting for the draws before, a wait each time in heavy scenes
+constexpr uint32_t kVertexRing = 32u << 20, kVertexParts = 4, kVertexPart = kVertexRing / kVertexParts;
+// copies of palettes the title rewrites while drawn, one per distinct set of colours, so the textures decoded with one
+// keep their place in the texture cache
+constexpr uint32_t kPaletteStore = 2u << 20;
 
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
-enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport };
+enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport, Hold };
 
 struct Cmd {
     Op op;
@@ -73,7 +80,7 @@ std::vector<Range> StateRanges() {
     return {
         {At(s, &s.rs), At(s, &s.textures) - At(s, &s.rs)},  // simple goes by SendSimple
         {At(s, &s.index_buffer), At(s, &s.vs) - At(s, &s.index_buffer)},
-        {At(s, &s.vsc), At(s, &s.rt) - At(s, &s.vsc)},
+        {At(s, &s.psc), At(s, &s.rt) - At(s, &s.psc)},  // vsc goes by SendVsc
         {At(s, &s.scissor_count), At(s, &s.transforms) - At(s, &s.scissor_count)},
         {At(s, &s.transforms[2]), 2 * sizeof(s.transforms[0])},
         {At(s, &s.transforms[16]), 4 * sizeof(s.transforms[0])},
@@ -94,6 +101,7 @@ bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
 }
 
 using Clock = std::chrono::steady_clock;
+Clock::time_point PerfStart() { return diag::Perf() ? Clock::now() : Clock::time_point{}; }
 uint64_t Ns(Clock::time_point t) { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count()); }
 
 class Threaded final : public Backend {
@@ -117,8 +125,16 @@ public:
     bool Init(uint32_t width, uint32_t height) override { return inner_->Init(width, height); }
 
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
-        auto t = Clock::now();
-        SendState(s);
+        auto t = PerfStart();
+        std::array<uint32_t, 16> copied{};
+        bool any = false;
+        if (!refilled_.empty()) {
+            for (size_t i = 0; i < s.streams.size(); i++) {
+                const auto& st = s.streams[i];
+                if (st.vb && refilled_.count(st.vb)) any |= (copied[i] = CopyVertices(s, st, start, count, indices)) != 0;
+            }
+        }
+        SendState(s, any ? &copied : nullptr);
         Cmd c{Op::Draw};
         c.a = prim;
         c.b = start;
@@ -129,17 +145,19 @@ public:
         }
         cur_->cmds.push_back(c);
         for (uint32_t tex : s.textures) Use(tex);
-        for (uint32_t pal : s.palettes) Use(pal);
-        for (const auto& st : s.streams) Use(st.vb);
+        for (size_t i = 0; i < s.palettes.size(); i++)
+            if (!palette_copied_[i]) Use(s.palettes[i]);
+        for (size_t i = 0; i < s.streams.size(); i++)
+            if (!copied[i]) Use(s.streams[i].vb);
         Use(s.rt.header);
         Use(s.zs.header);
         Written(s.rt);
         if (cur_->cmds.size() >= kBatchCommands) Submit();
-        g_perf_capture_ns += Ns(t);
+        if (diag::Perf()) g_perf_capture_ns.fetch_add(Ns(t), std::memory_order_relaxed);
     }
 
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z, uint32_t stencil) override {
-        auto t = Clock::now();
+        auto t = PerfStart();
         SendState(s);
         Cmd c{Op::Clear};
         c.a = count;
@@ -155,12 +173,12 @@ public:
         Use(s.rt.header);
         Use(s.zs.header);
         if (flags & kClearTarget) Written(s.rt);
-        g_perf_capture_ns += Ns(t);
+        if (diag::Perf()) g_perf_capture_ns.fetch_add(Ns(t), std::memory_order_relaxed);
     }
 
     // rects and points are taken now; the copy itself, CPU or GPU, runs in order like the console's
     void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override {
-        auto t = Clock::now();
+        auto t = PerfStart();
         Cmd c{Op::Copy};
         c.a = count;
         c.b = count && src_rects ? Scratch(kernel::HostPtr(src_rects), count * 16) : 0;
@@ -173,22 +191,35 @@ public:
         Use(src.header);
         Use(dst.header);
         Written(dst);
-        g_perf_capture_ns += Ns(t);
+        if (diag::Perf()) g_perf_capture_ns.fetch_add(Ns(t), std::memory_order_relaxed);
     }
 
+    void HoldFrame() override { cur_->cmds.push_back(Cmd{Op::Hold}); }
+
     void Present(const Surface& front) override {
-        auto t = Clock::now();
+        auto t = PerfStart();
         Cmd c{Op::Present};
         c.s1 = front;
         c.s1.header = Header(front.header);
         cur_->cmds.push_back(c);
         Use(front.header);
         uint64_t id = Submit();
-        g_perf_capture_ns += Ns(t);
-        // the title records one frame while the one before it draws, on the GPU too: a GPU bound frame rate then paces
-        // the game like a frame rate cap, and the frame times the game measures match the frames shown
+        if (diag::Perf()) g_perf_capture_ns.fetch_add(Ns(t), std::memory_order_relaxed);
+        // the title records one frame while the one before it is recorded for the GPU and the one before that draws on
+        // it: the three run at once on a multi-core CPU, and a GPU bound frame rate still paces the game like a frame
+        // rate cap, a frame further back. (Waiting on the GPU for the frame just before kept the title idle while the
+        // GPU drew it, every frame.)
+        if (!presents_) profiler::AddThisThread("title");
         Wait(last_present_, WaitFor::Frame, nullptr);
-        if (presents_) inner_->WaitGpuFrame(presents_ - 1);
+        if (presents_ >= 2) {
+            auto gpu = PerfStart();
+            inner_->WaitGpuFrame(presents_ - 2);
+            if (diag::Perf()) {
+                uint64_t ns = Ns(gpu);
+                g_perf_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+                g_perf_wait_kind_ns[size_t(WaitFor::Frame)].fetch_add(ns, std::memory_order_relaxed);
+            }
+        }
         presents_++;
         last_present_ = id;
     }
@@ -233,7 +264,14 @@ public:
     }
     void WaitResource(uint32_t resource) override {
         auto it = last_use_.find(resource);
-        if (it != last_use_.end()) Wait(it->second, WaitFor::Resource, "resource");
+        if (it == last_use_.end() || done_.load() >= it->second) return;
+        // a vertex buffer refilled while draws still read it: later draws read a copy instead
+        // a vertex buffer or palette rewritten while draws still read it: later draws read a copy instead
+        uint32_t type = resource ? kernel::R32(resource) & 0x70000 : 1;
+        if ((type == 0 || type == 0x30000) && refilled_.insert(resource).second && diag::Perf() && refilled_.size() <= 32)
+            LOGR("render thread: %s %08X rewritten while drawn, its draws read copies now", type ? "palette" : "vertex buffer",
+                 resource);
+        Wait(it->second, WaitFor::Resource, "resource");
     }
 
 private:
@@ -262,13 +300,88 @@ private:
     void ReadBack(uint32_t data, bool late) {
         // only surfaces the GPU wrote since the last read-back hold anything newer than guest memory
         if (!written_.erase(data)) return;
-        (late ? g_perf_sync_late : g_perf_sync_block)++;
+        if (diag::Perf()) (late ? g_perf_sync_late : g_perf_sync_block).fetch_add(1, std::memory_order_relaxed);
         if (diag::Perf() && logged_.insert(uint64_t(data) << 1 | (late ? 1 : 0)).second)
             LOGI("render thread: read-back of %08X for %s", data, late ? "a NOOVERWRITE lock without a finished copy" : "a lock / BlockOnResource");
         Cmd c{Op::Sync};
         c.a = data;
         cur_->cmds.push_back(c);
         Wait(Submit(), WaitFor::ReadBack, "read-back");
+    }
+
+    // The vertices this draw reads from a refilled buffer, copied: a header copy pointing at them, 0 to read the buffer
+    uint32_t CopyVertices(const State& s, const State::Stream& st, uint32_t start, uint32_t count, const uint8_t* indices) {
+        if (!st.stride || !count) return 0;
+        uint32_t lo = start, hi = start + count - 1;
+        if (indices) {
+            uint16_t l = 0xFFFF, h = 0;
+            for (uint32_t i = 0; i < count; i++) {
+                uint16_t v;
+                std::memcpy(&v, indices + size_t(i) * 2, 2);
+                l = std::min(l, v);
+                h = std::max(h, v);
+            }
+            lo = l + s.base_vertex;
+            hi = h + s.base_vertex;
+        }
+        uint32_t data = mem::VirtualFromPhysical(kernel::R32(st.vb + 4));
+        uint64_t begin = uint64_t(lo) * st.stride, end = (uint64_t(hi) + 1) * st.stride;
+        end = std::min<uint64_t>(end, mem::AllocationRemaining(data));  // 0 when unknown: the draw reads the buffer
+        if (begin >= end || end - begin > kVertexPart) return 0;
+        if (!vertex_ring_ && !(vertex_ring_ = mem::AllocSystem(kVertexRing, 64))) return 0;
+        uint32_t n = uint32_t((end - begin + 15) & ~uint64_t(15));
+        if (vertex_pos_ % kVertexRing + n > kVertexRing) vertex_pos_ += kVertexRing - vertex_pos_ % kVertexRing;
+        uint32_t at = uint32_t(vertex_pos_ % kVertexRing);
+        // a part is written again once the draws that read its last copies are done
+        for (uint32_t part : {at / kVertexPart, (at + n - 1) / kVertexPart}) {
+            if (part != vertex_part_) {
+                Wait(vertex_use_[part], WaitFor::Copy, "vertex copy");
+                vertex_part_ = part;
+            }
+            vertex_use_[part] = cur_->id;
+        }
+        vertex_pos_ += n;
+        std::memcpy(kernel::HostPtr(vertex_ring_ + at), kernel::HostPtr(data + uint32_t(begin)), size_t(end - begin));
+        uint8_t header[kHeaderBytes] = {};
+        std::memcpy(header, kernel::HostPtr(st.vb), 12);
+        uint32_t moved = vertex_ring_ + at - uint32_t(begin);  // system memory: read as it is, not as physical
+        std::memcpy(header + 4, &moved, 4);
+        return Scratch(header, kHeaderBytes);
+    }
+
+    // A refilled palette's colours, copied once per distinct set: a header copy pointing at them, 0 to read the palette
+    uint32_t CopyPalette(uint32_t header) {
+        uint32_t bytes = (256u >> (kernel::R32(header) >> 30)) * 4;
+        uint32_t data = mem::VirtualFromPhysical(kernel::R32(header + 4));
+        if (mem::AllocationRemaining(data) < bytes) return 0;
+        const uint8_t* colours = static_cast<const uint8_t*>(kernel::HostPtr(data));
+        uint64_t hash = 1469598103934665603ull ^ bytes;
+        for (uint32_t i = 0; i < bytes; i += 4) {
+            uint32_t v;
+            std::memcpy(&v, colours + i, 4);
+            hash = (hash ^ v) * 1099511628211ull;
+        }
+        uint32_t at = 0;
+        auto it = palette_copies_.find(hash);
+        if (it != palette_copies_.end() && !std::memcmp(kernel::HostPtr(it->second), colours, bytes)) {
+            at = it->second;
+        } else {
+            if (!palette_store_ && !(palette_store_ = mem::AllocSystem(kPaletteStore, 64))) return 0;
+            if (palette_used_ + bytes > kPaletteStore) {
+                // full: begun again once no draw reads a copy
+                Wait(Submit(), WaitFor::Copy, "palette copies");
+                palette_copies_.clear();
+                palette_used_ = 0;
+            }
+            at = palette_store_ + palette_used_;
+            palette_used_ += bytes;
+            std::memcpy(kernel::HostPtr(at), colours, bytes);
+            palette_copies_[hash] = at;
+        }
+        uint8_t copy[kHeaderBytes] = {};
+        std::memcpy(copy, kernel::HostPtr(header), 12);
+        std::memcpy(copy + 4, &at, 4);  // system memory: read as it is, not as physical
+        return Scratch(copy, kHeaderBytes);
     }
 
     // bytes the render thread reads through a guest address, in the header ring
@@ -332,21 +445,41 @@ private:
         }
     }
 
+    // vsc whole, or only the registers the title marked
+    void SendVsc(const State& s) {
+        if (!g_vsc_tracked) {
+            DeltaRange({At(s, &s.vsc), sizeof(s.vsc)}, reinterpret_cast<const uint8_t*>(&s));
+            return;
+        }
+        for (size_t w = 0; w < g_vsc_dirty.size(); w++) {
+            for (uint64_t bits = g_vsc_dirty[w]; bits; bits &= bits - 1) {
+                size_t reg = w * 64 + size_t(std::countr_zero(bits));
+                Delta(&sent_.vsc[reg], &s.vsc[reg], sizeof(s.vsc[reg]));
+            }
+            g_vsc_dirty[w] = 0;
+        }
+    }
+
     // what changed since the last command, in 64 byte pieces
-    void SendState(const State& s) {
+    void SendState(const State& s, const std::array<uint32_t, 16>* copied = nullptr) {
         const uint8_t* now = reinterpret_cast<const uint8_t*>(&s);
+        // before this state's bytes: a full palette store waits for the batches before
+        for (size_t i = 0; i < 4; i++)
+            palette_copied_[i] = s.palettes[i] && refilled_.count(s.palettes[i]) ? CopyPalette(s.palettes[i]) : 0;
         Cmd c{Op::State};
         size_t first = cur_->bytes.size();
         SendSimple(s);
+        SendVsc(s);
         for (const Range& r : ranges_) DeltaRange(r, now);
         std::array<uint32_t, 4> textures;
         for (size_t i = 0; i < 4; i++) textures[i] = Header(s.textures[i]);
         Delta(&sent_.textures, &textures, sizeof(textures));
         std::array<uint32_t, 4> palettes;
-        for (size_t i = 0; i < 4; i++) palettes[i] = Header(s.palettes[i]);
+        for (size_t i = 0; i < 4; i++) palettes[i] = palette_copied_[i] ? palette_copied_[i] : Header(s.palettes[i]);
         Delta(&sent_.palettes, &palettes, sizeof(palettes));
         auto streams = s.streams;
-        for (auto& st : streams) st.vb = Header(st.vb);
+        for (size_t i = 0; i < streams.size(); i++)
+            streams[i].vb = copied && (*copied)[i] ? (*copied)[i] : Header(streams[i].vb);
         Delta(&sent_.streams, &streams, sizeof(streams));
         Surface rt = s.rt, zs = s.zs;
         rt.header = Header(rt.header);
@@ -394,17 +527,19 @@ private:
     void Wait(uint64_t id, WaitFor kind, const char* why) {
         if (!id || done_.load() >= id) return;
         if (id >= cur_->id) id = Submit();
-        auto t = Clock::now();
+        auto t = PerfStart();
         {
             std::unique_lock lock(m_);
             done_cv_.wait(lock, [&] { return done_.load() >= id; });
         }
-        uint64_t ns = Ns(t);
-        g_perf_wait_ns += ns;
-        g_perf_wait_kind_ns[size_t(kind)] += ns;
-        if (why) {
-            g_perf_waits++;
-            if (diag::Perf()) LOG_FIRST(32, "render thread: the title waited %.2f ms for a %s", ns / 1e6, why);
+        if (diag::Perf()) {
+            uint64_t ns = Ns(t);
+            g_perf_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+            g_perf_wait_kind_ns[size_t(kind)].fetch_add(ns, std::memory_order_relaxed);
+            if (why) {
+                g_perf_waits.fetch_add(1, std::memory_order_relaxed);
+                LOG_FIRST(32, "render thread: the title waited %.2f ms for a %s", ns / 1e6, why);
+            }
         }
     }
 
@@ -413,6 +548,7 @@ private:
         if (auto set = reinterpret_cast<SetDescription>(
                 reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription"))))
             set(GetCurrentThread(), L"render");
+        profiler::AddThisThread("render");
         for (;;) {
             Batch* b;
             {
@@ -459,6 +595,7 @@ private:
             case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
             case Op::Copy: inner_->Copy(c.s1, c.s2, c.a, c.b, c.c); break;
             case Op::Present: inner_->Present(c.s1); break;
+            case Op::Hold: inner_->HoldFrame(); break;
             case Op::Sync: inner_->Sync(c.a, 0); break;
             case Op::RecordLate: inner_->RecordLate(c.a); break;
             case Op::Flush: inner_->Flush(); break;
@@ -491,6 +628,13 @@ private:
     Batch* cur_ = nullptr;
     State sent_;  // the state as the render thread will have it
     std::unordered_map<uint32_t, uint64_t> last_use_;
+    std::unordered_set<uint32_t> refilled_;          // vertex buffers and palettes the title waited on, by header
+    std::unordered_map<uint64_t, uint32_t> palette_copies_;  // by the colours' hash
+    uint32_t palette_store_ = 0, palette_used_ = 0;
+    std::array<uint32_t, 4> palette_copied_{};       // the last state sent: its palettes' copies, 0 where none
+    uint32_t vertex_ring_ = 0, vertex_part_ = 0;
+    uint64_t vertex_pos_ = 0;
+    std::array<uint64_t, kVertexParts> vertex_use_{};  // the last batch reading copies in each part
     std::unordered_set<uint32_t> written_;  // surfaces drawn since their last read-back, by data address
     std::unordered_set<uint64_t> logged_;   // perf diagnostic: read-backs named once, by address and kind
     uint64_t next_id_ = 0, last_present_ = 0;

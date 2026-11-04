@@ -229,6 +229,7 @@ void UpdateViewportConstants() {
     if (!g_own_constants) {
         g_state.vsc[58] = {hw, -hh, (v.max_z - v.min_z) * g_state.zscale, 0};
         g_state.vsc[59] = {v.x + g_state.ss_offset_x + hw, v.y + g_state.ss_offset_y + hh, v.min_z * g_state.zscale, 0};
+        gpu::MarkVsc(58, 2);
     }
     // the viewport as the library's SetViewport stores it, for inlined readers
     if (XDK_CDevice_Viewport != xdk::kUnknown) {
@@ -344,6 +345,11 @@ void VerticalBlank(X86Context& ctx) {
 gpu::State& State() { return g_state; }
 std::recursive_mutex& Lock() { return g_lock; }
 
+void HoldFrame() {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (g_backend) g_backend->HoldFrame();
+}
+
 }  // namespace d3d
 
 using namespace d3d;
@@ -368,6 +374,8 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
     g_state = gpu::State{};
     gpu::MarkAllSimple();
     gpu::g_simple_tracked = true;
+    gpu::MarkAllVsc();
+    gpu::g_vsc_tracked = true;
     SetFrameBuffers("CreateDevice", a[4]);
     // 60 Hz, widescreen
     if (XDK_CDevice_DisplayFlags != xdk::kUnknown) SetDev(XDK_CDevice_DisplayFlags, 0x400000 | (app::Widescreen() ? 0x10000 : 0));
@@ -396,6 +404,20 @@ HLE_STDCALL(D3DDevice_Release, 0) { return 1; }
 
 // synchronisation, the renderer never runs behind
 
+// perf diagnostic: who waits for the GPU to finish with a buffer, once each per resource and caller
+static void LogBusyWait(const char* what, uint32_t res, uint32_t esp) {
+    if (!diag::Perf() || !g_backend || !g_backend->Busy(res)) return;
+    static std::unordered_set<uint64_t> seen;
+    uint32_t code[4] = {}, n = 0;
+    for (uint32_t i = 0; i < 32 && n < 4; i++) {
+        uint32_t v = R32(esp + i * 4);
+        if (dispatch::InCode(v)) code[n++] = v;
+    }
+    if (seen.size() < 64 && seen.insert(uint64_t(res) << 32 | code[0]).second)
+        LOGR("d3d: %s waits on busy %08X (type %05X data %08X), stack %08X %08X %08X %08X", what, res,
+             R32(res) & 0x70000, R32(res + 4), code[0], code[1], code[2], code[3]);
+}
+
 HLE_STDCALL(D3D_BlockOnResource, 1) {
     uint32_t res = a[0];
     if (res && g_backend) {
@@ -415,6 +437,7 @@ HLE_STDCALL(D3D_BlockOnResource, 1) {
             }
             g_backend->Sync(data, 0);
         } else {
+            LogBusyWait("BlockOnResource", res, ctx.esp);
             g_backend->WaitResource(res);
         }
     }
@@ -433,6 +456,7 @@ HLE_WRAP(Lock2DSurface, 6) {
 HLE_STDCALL(D3DResource_BlockUntilNotBusy, 1) {
     if (a[0] && g_backend) {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
+        LogBusyWait("BlockUntilNotBusy", a[0], ctx.esp);
         g_backend->WaitResource(a[0]);
     }
     gpu::MarkDirty(a[0]);
@@ -443,6 +467,7 @@ HLE_STDCALL(D3DResource_BlockUntilNotBusy, 1) {
 HLE_STDCALL(D3D_BlockOnNonSurfaceResource, 1) {
     if (a[0] && g_backend) {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
+        LogBusyWait("BlockOnNonSurfaceResource", a[0], ctx.esp);
         g_backend->WaitResource(a[0]);
     }
     gpu::MarkDirty(a[0]);
@@ -667,7 +692,14 @@ HLE_STDCALL(D3DDevice_CopyRects, 5) {
 HLE_STDCALL(D3DDevice_SetViewport, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t v = a[0];
-    g_state.viewport = {R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20)};
+    if (!v) {
+        // later XDKs (5455) take null as the whole render target, which the library's own SetBackBufferScale passes
+        uint32_t w, h;
+        gpu::SurfaceSize(g_state.rt, w, h);
+        g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
+    } else {
+        g_state.viewport = {R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20)};
+    }
     g_state.scissor_count = 0;
     UpdateViewportConstants();
     return 0;
@@ -939,7 +971,7 @@ HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
             g_state.vs = it->second;
             // constants declared with the shader load when it is selected
             for (auto& [reg, v] : it->second->constants)
-                if (reg < 192) g_state.vsc[reg] = v;
+                if (reg < 192) g_state.vsc[reg] = v, gpu::MarkVsc(reg);
         } else {
             LOG_FIRST(8, "d3d: SetVertexShader with unknown handle %08X", h);
         }
@@ -949,25 +981,27 @@ HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1Fast, 0) {
     uint32_t reg = a[0];
-    if (reg < 192) std::memcpy(g_state.vsc[reg].data(), HostPtr(a[1]), 16);
+    if (reg < 192) std::memcpy(g_state.vsc[reg].data(), HostPtr(a[1]), 16), gpu::MarkVsc(reg);
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1, 0) {
     uint32_t reg = a[0];
-    if (reg < 192) std::memcpy(g_state.vsc[reg].data(), HostPtr(a[1]), 16);
+    if (reg < 192) std::memcpy(g_state.vsc[reg].data(), HostPtr(a[1]), 16), gpu::MarkVsc(reg);
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant4, 0) {
     uint32_t reg = a[0], src = a[1];
     for (uint32_t i = 0; i < 4 && reg + i < 192; i++) std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
+    gpu::MarkVsc(reg, 4);
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstantNotInlineFast, 1) {
     uint32_t reg = a[0], src = a[1], dwords = a[2];
     for (uint32_t i = 0; i < dwords / 4 && reg + i < 192; i++) std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
+    gpu::MarkVsc(reg, dwords / 4);
     return 0;
 }
 
@@ -1362,6 +1396,7 @@ bool ApplyConstant(uint32_t m, uint32_t v) {
     if (m < kConstantData || m >= kConstantDataEnd) return false;
     if (g_constant_register < kConstantRegisters) {
         std::memcpy(&g_state.vsc[g_constant_register][g_constant_component], &v, 4);
+        gpu::MarkVsc(g_constant_register);
     }
     if (++g_constant_component == 4) {
         g_constant_component = 0;

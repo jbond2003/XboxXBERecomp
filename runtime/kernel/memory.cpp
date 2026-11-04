@@ -193,6 +193,15 @@ public:
         return it == used_.end() ? 0 : it->second;
     }
 
+    // bytes from a to the end of the allocation holding it, 0 outside any
+    uint32_t Remaining(uint32_t a) const {
+        auto it = used_.upper_bound(a);
+        if (it == used_.begin()) return 0;
+        --it;
+        uint64_t end = uint64_t(it->first) + it->second;
+        return a < end ? uint32_t(end - a) : 0;
+    }
+
     uint64_t Used() const {
         uint64_t n = 0;
         for (auto& u : used_) n += u.second;
@@ -408,6 +417,15 @@ uint32_t AllocationSize(uint32_t va) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (uint32_t s = g_contig.SizeOf(va)) return s;
     if (uint32_t s = g_system.SizeOf(va)) return s;
+    uint32_t start;
+    if (Reservation* r = FindReservation(va, &start)) return r->size - (va - start);
+    return 0;
+}
+
+uint32_t AllocationRemaining(uint32_t va) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (uint32_t s = g_contig.Remaining(va)) return s;
+    if (uint32_t s = g_system.Remaining(va)) return s;
     uint32_t start;
     if (Reservation* r = FindReservation(va, &start)) return r->size - (va - start);
     return 0;

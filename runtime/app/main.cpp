@@ -13,6 +13,7 @@
 #include <chrono>
 #include <csignal>
 #include <cwchar>
+#include <filesystem>
 #include <thread>
 
 #include <imgui.h>
@@ -47,7 +48,7 @@ LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
             LOGE("  %s %llX, guest %08llX", r->ExceptionInformation[0] ? "write" : "read", (unsigned long long)va,
                  (unsigned long long)(va - g));
         }
-        kernel::LogGuestStack(*t->ctx, 256);
+        kernel::LogGuestStack(*t->ctx, 1024);
     }
     auto dir = ExeDir() / "CrashDumps";
     CreateDirectoryW(dir.c_str(), nullptr);
@@ -56,6 +57,13 @@ LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
     wchar_t name[64];
     swprintf(name, 64, L"%ls.%04u.%02u.%02u_%02u.%02u.%02u.dmp", kGame.name, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute,
              t.wSecond);
+    // the log beside the dump: the next start overwrites the release log, and it holds the guest stack above
+    logx::Flush();
+    if (!logx::Path().empty()) {
+        std::error_code ec;
+        std::filesystem::copy_file(logx::Path(), (dir / name).replace_extension(L".log"),
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+    }
     HANDLE f = CreateFileW((dir / name).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return EXCEPTION_CONTINUE_SEARCH;
     MINIDUMP_EXCEPTION_INFORMATION info{GetCurrentThreadId(), e, FALSE};
@@ -224,7 +232,12 @@ void Pace() {
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
     uint32_t cap = Get().fps_cap;
-    if (cap == kFpsCapRefresh) cap = RefreshRate();
+    uint32_t refresh = RefreshRate();
+    if (cap == kFpsCapRefresh) cap = refresh;
+    // with vertical sync on, a cap at or above the refresh rate is the display's own pace: a second, timer based
+    // limiter beside it beats against the real blanks (the mode's whole hertz, 143 or 144 for 143.98, never quite
+    // matches) and repeats or drops a frame every second or so
+    if (Get().vsync && cap && refresh && cap >= refresh) cap = 0;
     auto now = clock::now();
     if (!cap) {
         next = now;

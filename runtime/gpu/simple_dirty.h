@@ -18,4 +18,15 @@ inline void MarkSimple(uint32_t index) {
 
 inline void MarkAllSimple() { g_simple_dirty = {~0ull, ~0ull}; }
 
+// State::vsc registers the title wrote since the render thread was last sent them, a bit per register: the 3 KB of
+// them is not compared every draw either. g_vsc_tracked as g_simple_tracked.
+inline std::array<uint64_t, 3> g_vsc_dirty = {~0ull, ~0ull, ~0ull};
+inline bool g_vsc_tracked = false;
+
+inline void MarkVsc(uint32_t reg, uint32_t count = 1) {
+    for (uint32_t r = reg; r < reg + count && r < 192; r++) g_vsc_dirty[r / 64] |= 1ull << (r % 64);
+}
+
+inline void MarkAllVsc() { g_vsc_dirty = {~0ull, ~0ull, ~0ull}; }
+
 }  // namespace gpu

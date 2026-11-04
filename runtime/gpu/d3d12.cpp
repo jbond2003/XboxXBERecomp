@@ -13,6 +13,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <vector>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -61,6 +62,7 @@ constexpr uint32_t kNoQuery = ~0u;
 
 // perf diagnostic: where a frame's time goes, logged once a second with diag::Perf
 using PerfClock = std::chrono::steady_clock;
+PerfClock::time_point PerfStart() { return diag::Perf() ? PerfClock::now() : PerfClock::time_point{}; }
 double PerfMs(PerfClock::time_point t) {
     return std::chrono::duration<double, std::milli>(PerfClock::now() - t).count();
 }
@@ -460,6 +462,7 @@ public:
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override;
     void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override;
     void Present(const Surface& front) override;
+    void HoldFrame() override { hold_pending_ = true; }
     void WaitGpuFrame(uint64_t n) override;
     void Sync(uint32_t data, uint32_t size) override;
     void SyncLate(uint32_t data) override;
@@ -802,6 +805,10 @@ private:
     std::deque<Report> reports_;
     bool tearing_ = false;
     uint64_t presents_ = 0;
+    // HoldFrame: drew_ marks a frame with a draw, clear or copy; shown_ is the guest frame buffer last presented
+    bool drew_ = false, hold_ = false, hold_pending_ = false;
+    uint64_t hold_from_ = 0;
+    uint32_t shown_ = 0;
     double fps_ = 0;
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
     uint64_t fps_n_ = 0;
@@ -847,6 +854,7 @@ bool D3D12Backend::CreateDevice() {
     DXGI_ADAPTER_DESC1 ad{};
     if (adapter) adapter->GetDesc1(&ad);
     LOGR("D3D12 adapter: %ls", adapter ? ad.Description : L"default");
+    if (diag::Perf()) LOGR("perf logging: on");
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     dev_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_));
@@ -1414,6 +1422,48 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over), cb.gpu, slot, si);
 }
 
+namespace {
+
+// compiled shaders kept beside the exe across sessions, by Compile's hash of source, entry point and profile; the
+// version changes when the compile flags or the HLSL generators change in a way the source hash misses
+constexpr uint32_t kShaderCacheVersion = 1;
+
+std::filesystem::path ShaderCachePath(uint64_t hash) {
+    char name[48];
+    std::snprintf(name, sizeof(name), "%016llx_%u.dxbc", (unsigned long long)hash, kShaderCacheVersion);
+    return app::ExeDir() / "shader_cache" / name;
+}
+
+bool LoadCachedShader(uint64_t hash, ComPtr<ID3DBlob>& code) {
+    std::error_code ec;
+    std::filesystem::path path = ShaderCachePath(hash);
+    uintmax_t size = std::filesystem::file_size(path, ec);
+    if (ec || !size || size > (16u << 20)) return false;
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) return false;
+    bool ok = SUCCEEDED(D3DCreateBlob(SIZE_T(size), &code)) &&
+              std::fread(code->GetBufferPointer(), 1, size_t(size), f) == size_t(size);
+    std::fclose(f);
+    if (!ok) code.Reset();
+    return ok;
+}
+
+void SaveCachedShader(uint64_t hash, ID3DBlob* code) {
+    std::error_code ec;
+    std::filesystem::path path = ShaderCachePath(hash);
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::filesystem::path temp = path;
+    temp += L".tmp";
+    FILE* f = _wfopen(temp.c_str(), L"wb");
+    if (!f) return;
+    bool ok = std::fwrite(code->GetBufferPointer(), 1, code->GetBufferSize(), f) == code->GetBufferSize();
+    ok = std::fclose(f) == 0 && ok;
+    if (ok) std::filesystem::rename(temp, path, ec);
+    if (!ok || ec) std::filesystem::remove(temp, ec);
+}
+
+}  // namespace
+
 ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
     // one source can hold several entry points
     uint64_t profile_seed = Hash(profile, std::strlen(profile));
@@ -1424,6 +1474,11 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
     ComPtr<ID3DBlob> code;
     ComPtr<ID3DBlob> err;
     PerfScope perf_compile{g_perf.compile};
+    // compiled before, in this session or an earlier one: D3DCompile is what makes a new effect's first frame hitch
+    if (LoadCachedShader(hash, code)) {
+        blobs_[hash] = code;
+        return code.Get();
+    }
     g_perf.shaders++;
     HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry, profile,
                             D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
@@ -1434,6 +1489,7 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
         return nullptr;
     }
     blobs_[hash] = code;
+    SaveCachedShader(hash, code.Get());
     return code.Get();
 }
 
@@ -1860,9 +1916,9 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
         tx.frame = presents_ + 1;
         tx.palette = palette.hash;
         const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
-        auto perf_t = PerfClock::now();
+        auto perf_t = PerfStart();
         uint64_t sig = MemSig(d.data, total) ^ DirtyEpoch(d.data) ^ palette.hash;
-        g_perf.sig += PerfMs(perf_t);
+        if (diag::Perf()) g_perf.sig += PerfMs(perf_t);
         if (sig != tx.sig || !same) {
             PerfScope perf_up{g_perf.texup};
             g_perf.texups++;
@@ -2803,6 +2859,7 @@ State SpriteStageZero(const State& s) {
 }
 
 void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
+    drew_ = true;
     if (SpriteOnStage3(s, prim)) {
         Draw(SpriteStageZero(s), prim, start, count, indices);
         return;
@@ -2949,6 +3006,7 @@ void D3D12Backend::ClearChannels(Target& t, const float col[4], uint8_t mask, co
 
 void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                          uint32_t stencil) {
+    drew_ = true;
     PerfScope perf_clear{g_perf.clear};
     if (cap_) {
         CapStep(s.rt);
@@ -3116,6 +3174,7 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
 
 void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects,
                         uint32_t dst_points) {
+    drew_ = true;
     PerfScope perf_copy{g_perf.copy};
     Target* src_t = FindTarget(src, false);
     if (cap_) {
@@ -3285,9 +3344,9 @@ void D3D12Backend::ReleaseOldTextures() {
 void D3D12Backend::ResetFrame() {
     Frame& f = CurrentFrame();
     if (f.fence && fence_->GetCompletedValue() < f.fence) {
-        auto perf_wait = PerfClock::now();
+        auto perf_wait = PerfStart();
         WaitFence(f.fence);
-        g_perf.wait += PerfMs(perf_wait);
+        if (diag::Perf()) g_perf.wait += PerfMs(perf_wait);
     }
     f.alloc->Reset();
     f.garbage.clear();
@@ -3311,18 +3370,25 @@ void D3D12Backend::CountFps() {
 void LogPerf() {
     static PerfClock::time_point perf_start = PerfClock::now();
     static uint64_t perf_frames = 0;
+    static PerfClock::time_point previous = perf_start;
+    static bool have_previous = false;
+    static std::vector<double> intervals;  // present to present, ms
+    auto now = PerfClock::now();
+    if (have_previous) intervals.push_back(std::chrono::duration<double, std::milli>(now - previous).count());
+    have_previous = true;
+    previous = now;
     perf_frames++;
     double el = PerfMs(perf_start);
     if (el >= 1000.0) {
         Perf& p = g_perf;
         double n = double(perf_frames);
         double host = p.draw + p.clear + p.copy + p.present + p.sync;
-        LOGI("perf: %.1f fps %.2f ms/frame | host %.2f (draw %.2f: assemble %.2f bind %.2f [check %.2f, upload %.2f] "
+        LOGR("perf: %.1f fps %.2f ms/frame | host %.2f (draw %.2f: assemble %.2f bind %.2f [check %.2f, upload %.2f] "
              "compile %.2f; clear %.2f copy %.2f sync %.2f present %.2f [swap %.2f wait %.2f]) other %.2f",
              n * 1000.0 / el, el / n, host / n, p.draw / n, p.assemble / n, p.bind / n, p.sig / n, p.texup / n,
              p.compile / n, p.clear / n, p.copy / n, p.sync / n, p.present / n, p.swap / n, p.wait / n,
              (el - host) / n);
-        LOGI("perf: title thread per frame: recording %.2f ms, waiting %.2f ms (%.1f waits: read-back %.2f "
+        LOGR("perf: title thread per frame: recording %.2f ms, waiting %.2f ms (%.1f waits: read-back %.2f "
              "resource %.2f fence %.2f flush %.2f copy %.2f, next frame %.2f) | read-backs waited for: %.1f lock, "
              "%.1f NOOVERWRITE",
              g_perf_capture_ns.exchange(0) / n / 1e6, g_perf_wait_ns.exchange(0) / n / 1e6,
@@ -3331,13 +3397,21 @@ void LogPerf() {
              g_perf_wait_kind_ns[3].exchange(0) / n / 1e6, g_perf_wait_kind_ns[4].exchange(0) / n / 1e6,
              g_perf_wait_kind_ns[5].exchange(0) / n / 1e6, g_perf_sync_block.exchange(0) / n,
              g_perf_sync_late.exchange(0) / n);
-        LOGI("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.0f checks %.2f MB "
+        LOGR("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.0f checks %.2f MB "
              "hashed | %.1f tex uploads %.2f MB, %.1f new tex, %.1f new targets, %.1f target uploads, %.1f shrinks, "
              "%.1f read-backs %.1f late | %llu shaders %llu psos this second",
              p.draws / n, p.raw / n, p.verts / n / 1000.0, p.upload / n / 1048576.0, p.overflow / n, p.sigs / n,
              p.sig_bytes / n / 1048576.0, p.texups / n, p.texup_bytes / n / 1048576.0, p.newtex / n,
              p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
              (unsigned long long)p.shaders, (unsigned long long)p.psos);
+        if (!intervals.empty()) {
+            std::sort(intervals.begin(), intervals.end());
+            const auto percentile = [&](size_t percent) { return intervals[(intervals.size() - 1) * percent / 100]; };
+            const auto over = intervals.end() - std::upper_bound(intervals.begin(), intervals.end(), 1000.0 / 240);
+            LOGR("perf: present intervals p50 %.2f p95 %.2f p99 %.2f worst %.2f ms; over 240 fps budget %zu/%zu",
+                 percentile(50), percentile(95), percentile(99), intervals.back(), size_t(over), intervals.size());
+            intervals.clear();
+        }
         g_perf = Perf{};
         perf_start = PerfClock::now();
         perf_frames = 0;
@@ -3352,9 +3426,28 @@ void D3D12Backend::Present(const Surface& front) {
         StartCapture();
     }
     ResizeSwap();
-    Target* t = EnsureTarget(front, false);
-    if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
-    if (t) Resolve(*t);
+    // a hold lasts until a frame draws again, ten seconds at most
+    constexpr uint64_t kHoldPresents = 600;
+    bool start = hold_pending_;
+    hold_pending_ = false;
+    if (start) {
+        hold_ = true;
+        hold_from_ = presents_;
+    } else if (hold_ && (drew_ || presents_ - hold_from_ > kHoldPresents)) {
+        hold_ = false;
+    }
+    Target* t = nullptr;
+    if (hold_ && !drew_ && shown_) {
+        for (auto& [key, target] : targets_)
+            if (!target.depth && target.data == shown_) t = &target;
+    }
+    if (!t) {
+        t = EnsureTarget(front, false);
+        if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
+        if (t) Resolve(*t);
+        shown_ = t ? t->data : 0;
+    }
+    drew_ = false;
     if (ramp_dirty_) UploadGammaRamp();
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
@@ -3364,9 +3457,9 @@ void D3D12Backend::Present(const Surface& front) {
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
     DeliverReports();
     bool vsync = app::Get().vsync;
-    auto perf_swap = PerfClock::now();
+    auto perf_swap = PerfStart();
     swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
-    g_perf.swap += PerfMs(perf_swap);
+    if (diag::Perf()) g_perf.swap += PerfMs(perf_swap);
 
     presents_++;
     presents_seen_.store(presents_);

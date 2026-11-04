@@ -38,6 +38,7 @@ void ReserveImage(uint32_t base, uint32_t size);
 uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint32_t align);
 void FreeContiguous(uint32_t va);
 uint32_t AllocationSize(uint32_t va);  // any allocator, 0 if unknown
+uint32_t AllocationRemaining(uint32_t va);  // from va to the end of the allocation holding it, 0 if unknown
 
 uint32_t AllocSystem(uint32_t size, uint32_t align = 16);
 void FreeSystem(uint32_t va);
