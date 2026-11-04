@@ -80,7 +80,7 @@ std::vector<Range> StateRanges() {
     return {
         {At(s, &s.rs), At(s, &s.textures) - At(s, &s.rs)},  // simple goes by SendSimple
         {At(s, &s.index_buffer), At(s, &s.vs) - At(s, &s.index_buffer)},
-        {At(s, &s.vsc), At(s, &s.rt) - At(s, &s.vsc)},
+        {At(s, &s.psc), At(s, &s.rt) - At(s, &s.psc)},  // vsc goes by SendVsc
         {At(s, &s.scissor_count), At(s, &s.transforms) - At(s, &s.scissor_count)},
         {At(s, &s.transforms[2]), 2 * sizeof(s.transforms[0])},
         {At(s, &s.transforms[16]), 4 * sizeof(s.transforms[0])},
@@ -203,13 +203,15 @@ public:
         Use(front.header);
         uint64_t id = Submit();
         if (diag::Perf()) g_perf_capture_ns.fetch_add(Ns(t), std::memory_order_relaxed);
-        // the title records one frame while the one before it draws, on the GPU too: a GPU bound frame rate then paces
-        // the game like a frame rate cap, and the frame times the game measures match the frames shown
+        // the title records one frame while the one before it is recorded for the GPU and the one before that draws on
+        // it: the three run at once on a multi-core CPU, and a GPU bound frame rate still paces the game like a frame
+        // rate cap, a frame further back. (Waiting on the GPU for the frame just before kept the title idle while the
+        // GPU drew it, every frame.)
         if (!presents_) profiler::AddThisThread("title");
         Wait(last_present_, WaitFor::Frame, nullptr);
-        if (presents_) {
+        if (presents_ >= 2) {
             auto gpu = PerfStart();
-            inner_->WaitGpuFrame(presents_ - 1);
+            inner_->WaitGpuFrame(presents_ - 2);
             if (diag::Perf()) {
                 uint64_t ns = Ns(gpu);
                 g_perf_wait_ns.fetch_add(ns, std::memory_order_relaxed);
@@ -441,6 +443,21 @@ private:
         }
     }
 
+    // vsc whole, or only the registers the title marked
+    void SendVsc(const State& s) {
+        if (!g_vsc_tracked) {
+            DeltaRange({At(s, &s.vsc), sizeof(s.vsc)}, reinterpret_cast<const uint8_t*>(&s));
+            return;
+        }
+        for (size_t w = 0; w < g_vsc_dirty.size(); w++) {
+            for (uint64_t bits = g_vsc_dirty[w]; bits; bits &= bits - 1) {
+                size_t reg = w * 64 + size_t(std::countr_zero(bits));
+                Delta(&sent_.vsc[reg], &s.vsc[reg], sizeof(s.vsc[reg]));
+            }
+            g_vsc_dirty[w] = 0;
+        }
+    }
+
     // what changed since the last command, in 64 byte pieces
     void SendState(const State& s, const std::array<uint32_t, 16>* copied = nullptr) {
         const uint8_t* now = reinterpret_cast<const uint8_t*>(&s);
@@ -450,6 +467,7 @@ private:
         Cmd c{Op::State};
         size_t first = cur_->bytes.size();
         SendSimple(s);
+        SendVsc(s);
         for (const Range& r : ranges_) DeltaRange(r, now);
         std::array<uint32_t, 4> textures;
         for (size_t i = 0; i < 4; i++) textures[i] = Header(s.textures[i]);
