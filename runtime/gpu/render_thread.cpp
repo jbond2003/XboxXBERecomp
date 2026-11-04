@@ -50,7 +50,7 @@ constexpr uint32_t kPaletteStore = 2u << 20;
 
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
-enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport };
+enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport, Hold };
 
 struct Cmd {
     Op op;
@@ -193,6 +193,8 @@ public:
         Written(dst);
         if (diag::Perf()) g_perf_capture_ns.fetch_add(Ns(t), std::memory_order_relaxed);
     }
+
+    void HoldFrame() override { cur_->cmds.push_back(Cmd{Op::Hold}); }
 
     void Present(const Surface& front) override {
         auto t = PerfStart();
@@ -593,6 +595,7 @@ private:
             case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
             case Op::Copy: inner_->Copy(c.s1, c.s2, c.a, c.b, c.c); break;
             case Op::Present: inner_->Present(c.s1); break;
+            case Op::Hold: inner_->HoldFrame(); break;
             case Op::Sync: inner_->Sync(c.a, 0); break;
             case Op::RecordLate: inner_->RecordLate(c.a); break;
             case Op::Flush: inner_->Flush(); break;

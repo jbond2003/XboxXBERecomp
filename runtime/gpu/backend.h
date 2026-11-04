@@ -27,6 +27,9 @@ public:
     virtual void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects_va,
                       uint32_t dst_points_va) = 0;
     virtual void Present(const Surface& front) = 0;
+    // until the title draws again, presents show the last picture drawn: a stopped movie's frame buffers each hold
+    // another of its pictures, and presents with nothing drawn would flick between them
+    virtual void HoldFrame() {}
     // the CPU is about to touch this resource's memory: write GPU results back first
     virtual void Sync(uint32_t data_va, uint32_t size) = 0;
     // a lock that does not wait for the GPU (NOOVERWRITE): a result a frame or two old is what the console gives too

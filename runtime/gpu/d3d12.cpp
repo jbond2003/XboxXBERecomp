@@ -462,6 +462,7 @@ public:
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override;
     void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override;
     void Present(const Surface& front) override;
+    void HoldFrame() override { hold_pending_ = true; }
     void WaitGpuFrame(uint64_t n) override;
     void Sync(uint32_t data, uint32_t size) override;
     void SyncLate(uint32_t data) override;
@@ -804,6 +805,10 @@ private:
     std::deque<Report> reports_;
     bool tearing_ = false;
     uint64_t presents_ = 0;
+    // HoldFrame: drew_ marks a frame with a draw, clear or copy; shown_ is the guest frame buffer last presented
+    bool drew_ = false, hold_ = false, hold_pending_ = false;
+    uint64_t hold_from_ = 0;
+    uint32_t shown_ = 0;
     double fps_ = 0;
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
     uint64_t fps_n_ = 0;
@@ -2854,6 +2859,7 @@ State SpriteStageZero(const State& s) {
 }
 
 void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
+    drew_ = true;
     if (SpriteOnStage3(s, prim)) {
         Draw(SpriteStageZero(s), prim, start, count, indices);
         return;
@@ -3000,6 +3006,7 @@ void D3D12Backend::ClearChannels(Target& t, const float col[4], uint8_t mask, co
 
 void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                          uint32_t stencil) {
+    drew_ = true;
     PerfScope perf_clear{g_perf.clear};
     if (cap_) {
         CapStep(s.rt);
@@ -3167,6 +3174,7 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
 
 void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects,
                         uint32_t dst_points) {
+    drew_ = true;
     PerfScope perf_copy{g_perf.copy};
     Target* src_t = FindTarget(src, false);
     if (cap_) {
@@ -3418,9 +3426,28 @@ void D3D12Backend::Present(const Surface& front) {
         StartCapture();
     }
     ResizeSwap();
-    Target* t = EnsureTarget(front, false);
-    if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
-    if (t) Resolve(*t);
+    // a hold lasts until a frame draws again, ten seconds at most
+    constexpr uint64_t kHoldPresents = 600;
+    bool start = hold_pending_;
+    hold_pending_ = false;
+    if (start) {
+        hold_ = true;
+        hold_from_ = presents_;
+    } else if (hold_ && (drew_ || presents_ - hold_from_ > kHoldPresents)) {
+        hold_ = false;
+    }
+    Target* t = nullptr;
+    if (hold_ && !drew_ && shown_) {
+        for (auto& [key, target] : targets_)
+            if (!target.depth && target.data == shown_) t = &target;
+    }
+    if (!t) {
+        t = EnsureTarget(front, false);
+        if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
+        if (t) Resolve(*t);
+        shown_ = t ? t->data : 0;
+    }
+    drew_ = false;
     if (ramp_dirty_) UploadGammaRamp();
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
