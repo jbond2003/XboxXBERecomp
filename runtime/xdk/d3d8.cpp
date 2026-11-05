@@ -73,6 +73,14 @@ bool InCode(uint32_t va);  // cpu/dispatch.cpp
 #define SYM_D3DDevice_Reset FFFFFE08
 #define HAS_D3DDevice_Reset 0
 #endif
+#ifndef SYM_D3DDevice_SelectVertexShaderDirect
+#define SYM_D3DDevice_SelectVertexShaderDirect FFFFFE40
+#define HAS_D3DDevice_SelectVertexShaderDirect 0
+#endif
+#ifndef SYM_D3DDevice_SetVertexShaderInputDirect
+#define SYM_D3DDevice_SetVertexShaderInputDirect FFFFFE41
+#define HAS_D3DDevice_SetVertexShaderInputDirect 0
+#endif
 #ifndef SYM_D3DDevice_RunPushBuffer
 #define SYM_D3DDevice_RunPushBuffer FFFFFE09
 #define HAS_D3DDevice_RunPushBuffer 0
@@ -358,8 +366,11 @@ using namespace d3d;
 
 HLE_STDCALL(Direct3D_CreateDevice, 6) {
     XDK_REQUIRE("d3d", XDK_DATA(D3D_Device), XDK_DATA(D3D_pDevice), XDK_DATA(D3D_DirtyFlags),
-                XDK_DATA(D3D_DeferredTextureState), XDK_DATA(D3D_RenderState), XDK_DATA(D3D_Streams),
-                XDK_DATA(D3D_SimpleRenderStateEncode));
+                XDK_DATA(D3D_DeferredTextureState), XDK_DATA(D3D_RenderState), XDK_DATA(D3D_SimpleRenderStateEncode));
+#if HAS_D3DDevice_SetStreamSource
+    // a link time code generated library without SetStreamSource has no stream table (Big Red One)
+    XDK_REQUIRE("d3d", XDK_DATA(D3D_Streams));
+#endif
     XDK_REQUIRE("d3d", XDK_KEY(CDevice_Push), XDK_KEY(CDevice_PushThreshold), XDK_KEY(CDevice_BaseVertex),
                 XDK_KEY(CDevice_IndexBuffer), XDK_KEY(CDevice_ZScale), XDK_KEY(CDevice_SuperSampleX),
                 XDK_KEY(CDevice_SuperSampleY), XDK_KEY(CDevice_Transforms), XDK_KEY(CDevice_Textures),
@@ -960,15 +971,19 @@ HLE_STDCALL(D3DDevice_GetVertexShaderFunction, 3) {
     return 0;
 }
 
+namespace {
+void BindShader(std::shared_ptr<gpu::VertexShader> vs);
+}
+
 HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t h = a[0];
     g_state.vs_handle = h;
-    g_state.vs = nullptr;
+    BindShader(nullptr);
     if (h & 1) {
         auto it = g_vs.find(h);
         if (it != g_vs.end()) {
-            g_state.vs = it->second;
+            BindShader(it->second);
             // constants declared with the shader load when it is selected
             for (auto& [reg, v] : it->second->constants)
                 if (reg < 192) g_state.vsc[reg] = v, gpu::MarkVsc(reg);
@@ -1056,9 +1071,10 @@ std::vector<uint32_t> ProgramAt(uint32_t slot) {
     return program;
 }
 
-// a guest made shader's inputs, as its object holds them
-void ApplyGuestInputs(uint32_t handle, gpu::VertexShader& vs) {
-    uint32_t inputs = (handle & ~1u) + kShaderInputs;
+// 16 inputs of {stream, offset, type, unused} (D3DVERTEXATTRIBUTEFORMAT) into a shader's layout
+void ApplyInputArray(uint32_t inputs, gpu::VertexShader& vs) {
+    vs.inputs = {};
+    vs.stream_stride = {};
     for (uint32_t reg = 0; reg < kInputRegisters; reg++) {
         uint32_t entry = inputs + reg * kShaderInputBytes;
         uint32_t stream = R32(entry);
@@ -1069,6 +1085,36 @@ void ApplyGuestInputs(uint32_t handle, gpu::VertexShader& vs) {
         uint32_t end = offset + ElementBytes(type);
         vs.stream_stride[stream] = std::max(vs.stream_stride[stream], end);
     }
+}
+
+// a guest made shader's inputs, as its object holds them
+void ApplyGuestInputs(uint32_t handle, gpu::VertexShader& vs) { ApplyInputArray((handle & ~1u) + kShaderInputs, vs); }
+
+// SetVertexShaderInputDirect: an attribute format and stream inputs that replace the bound shader's, until cleared
+struct DirectInputs {
+    bool on = false;
+    std::array<gpu::VertexShader::Input, 16> inputs{};
+    std::array<uint32_t, 16> stream_stride{};
+};
+DirectInputs g_direct;
+std::shared_ptr<gpu::VertexShader> g_base_vs;  // the bound shader before direct inputs replace its layout
+
+// the bound shader, with the direct inputs when they are set; one object per program and layout
+void BindShader(std::shared_ptr<gpu::VertexShader> vs) {
+    g_base_vs = vs;
+    if (!g_direct.on || !vs) {
+        g_state.vs = std::move(vs);
+        return;
+    }
+    gpu::VertexShader with = *vs;
+    with.inputs = g_direct.inputs;
+    with.stream_stride = g_direct.stream_stride;
+    uint64_t key = gpu::Hash(with.program.data(), with.program.size() * 4, vs->hash ^ 0xD1EC7u);
+    key = gpu::Hash(with.inputs.data(), sizeof(with.inputs), key);
+    key = gpu::Hash(with.stream_stride.data(), sizeof(with.stream_stride), key);
+    auto& kept = g_selected[key];
+    if (!kept) kept = std::make_shared<gpu::VertexShader>(std::move(with));
+    g_state.vs = kept;
 }
 
 // the vertex inputs a selected program reads: a host made shader's, else the guest object's
@@ -1125,13 +1171,73 @@ HLE_STDCALL(D3DDevice_LoadVertexShaderProgram, 2) {
 HLE_STDCALL(D3DDevice_SelectVertexShader, 2) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t handle = a[0];
-    bool program_bound = (g_state.vs_handle & 1) && g_state.vs;
+    bool program_bound = (g_state.vs_handle & 1) && g_base_vs;
     if (!handle && !program_bound) {
         LOG_FIRST(8, "d3d: SelectVertexShader at slot %u without a bound vertex shader", a[1]);
         return 0;
     }
-    g_state.vs = SelectedShader(handle, a[1]);
+    BindShader(SelectedShader(handle, a[1]));
     if (handle) g_state.vs_handle = handle;
+    return 0;
+}
+
+// (attribute format, slot): the program at the slot runs with the format's inputs; no format only moves the start
+HLE_STDCALL(D3DDevice_SelectVertexShaderDirect, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    uint32_t vaf = a[0], slot = a[1];
+    bool program_bound = (g_state.vs_handle & 1) && g_base_vs;
+    if (!vaf && !program_bound) {
+        LOG_FIRST(8, "d3d: SelectVertexShaderDirect at slot %u without a bound vertex shader", slot);
+        return 0;
+    }
+    gpu::VertexShader vs;
+    vs.program = ProgramAt(slot);
+    vs.program_type = kVertexProgramType;
+    if (vaf) {
+        ApplyInputArray(vaf, vs);
+    } else {
+        vs.inputs = g_base_vs->inputs;
+        vs.stream_stride = g_base_vs->stream_stride;
+    }
+    uint64_t key = gpu::Hash(vs.program.data(), vs.program.size() * 4);
+    key = gpu::Hash(vs.inputs.data(), sizeof(vs.inputs), key);
+    key = gpu::Hash(vs.stream_stride.data(), sizeof(vs.stream_stride), key);
+    vs.hash = key;
+    auto& kept = g_selected[key];
+    if (!kept) kept = std::make_shared<gpu::VertexShader>(std::move(vs));
+    BindShader(kept);
+    g_state.vs_handle |= 1;  // programmable; the library's own direct shader object stands behind it
+    return 0;
+}
+
+// (attribute format, stream count, D3DSTREAM_INPUT {vertex buffer, stride, offset}[]): vertex data straight from these
+// streams, read with the format's layout, until a call without a format. The stream offsets move the elements.
+HLE_STDCALL(D3DDevice_SetVertexShaderInputDirect, 3) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    uint32_t vaf = a[0], count = std::min<uint32_t>(a[1], 16), streams = a[2];
+    static std::array<gpu::State::Stream, 16> before{};  // the streams SetStreamSource set
+    if (!vaf) {
+        if (g_direct.on) g_state.streams = before;
+        g_direct = {};
+        BindShader(g_base_vs);
+        return 0;
+    }
+    if (!g_direct.on) before = g_state.streams;
+    gpu::VertexShader layout;
+    ApplyInputArray(vaf, layout);
+    std::array<uint32_t, 16> offsets{};
+    for (uint32_t i = 0; i < 16; i++) {
+        uint32_t entry = streams + i * 12;
+        g_state.streams[i] = i < count ? gpu::State::Stream{R32(entry), R32(entry + 4)} : gpu::State::Stream{};
+        offsets[i] = i < count ? R32(entry + 8) : 0;
+    }
+    for (auto& in : layout.inputs)
+        if (in.stream >= 0) in.offset += offsets[size_t(in.stream)];
+    g_direct.on = true;
+    g_direct.inputs = layout.inputs;
+    for (uint32_t i = 0; i < 16; i++) g_direct.stream_stride[i] = layout.stream_stride[i] + offsets[i];
+    if (!(g_state.vs_handle & 1)) LOG_FIRST(4, "d3d: SetVertexShaderInputDirect with a fixed function shader %08X", g_state.vs_handle);
+    BindShader(g_base_vs);
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetShaderConstantMode, 1) {

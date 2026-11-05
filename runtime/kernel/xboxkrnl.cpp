@@ -375,7 +375,13 @@ KERNEL_EXPORT(175, MmLockUnlockBufferPages, 3) { return 0; }
 KERNEL_EXPORT(176, MmLockUnlockPhysicalPage, 2) { return 0; }
 KERNEL_EXPORT(180, MmQueryAllocationSize, 1) { return mem::AllocationSize(a[0]); }
 KERNEL_EXPORT(182, MmSetAddressProtect, 3) { return 0; }
-KERNEL_EXPORT(179, MmQueryAddressProtect, 1) { return 4; }  // PAGE_READWRITE
+// PAGE_READWRITE, except stack pages: a stack's top and the guard below the next one answer 0 (no access), as titles
+// find their stack's end by stepping up until a page is not read/write (Big Red One 0x93A10)
+KERNEL_EXPORT(179, MmQueryAddressProtect, 1) {
+    uint32_t va = a[0];
+    if (va >= mem::kStackBase && va - mem::kStackBase < mem::kStackSize) return mem::IsCommitted(va) ? 4 : 0;
+    return 4;
+}
 KERNEL_EXPORT(167, MmAllocateSystemMemory, 2) { return mem::AllocSystem(a[0], 0x1000); }
 KERNEL_EXPORT(172, MmFreeSystemMemory, 2) {
     mem::FreeSystem(a[0]);
