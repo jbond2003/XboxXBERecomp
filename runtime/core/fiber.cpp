@@ -27,6 +27,20 @@ struct Fiber {
 };
 
 static thread_local Fiber* t_current = nullptr;
+// The SSE control word goes with the switch: a fiber carries on the same guest thread, whose rounding mode the host
+// MXCSR holds, but Windows fibers (FIBER_FLAG_FLOAT_SWITCH) and swapcontext each keep their own.
+static thread_local uint32_t t_mxcsr = 0;
+
+static void SaveCsr() {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
+    __asm__ volatile("stmxcsr %0" : "=m"(t_mxcsr));
+#endif
+}
+static void LoadCsr() {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
+    __asm__ volatile("ldmxcsr %0" : : "m"(t_mxcsr));
+#endif
+}
 
 Fiber* Current() {
     if (t_current) return t_current;
@@ -43,12 +57,14 @@ Fiber* Current() {
 #ifdef _WIN32
 static void WINAPI Start(void* p) {
     Fiber* f = static_cast<Fiber*>(p);
+    LoadCsr();
     f->entry(f->arg);
     std::abort();  // entry returned
 }
 #else
 static void Start(unsigned lo, unsigned hi) {
     Fiber* f = reinterpret_cast<Fiber*>((uintptr_t(hi) << 32) | uintptr_t(lo));
+    LoadCsr();
     f->entry(f->arg);
     std::abort();
 }
@@ -87,11 +103,13 @@ void Switch(Fiber* to) {
     Fiber* from = Current();
     if (to == from) return;
     t_current = to;
+    SaveCsr();
 #ifdef _WIN32
     SwitchToFiber(to->handle);
 #else
     swapcontext(&from->uc, &to->uc);
 #endif
+    LoadCsr();  // whoever switched back to us saved theirs
 }
 
 void Destroy(Fiber* f) {

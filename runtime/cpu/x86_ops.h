@@ -103,9 +103,16 @@ inline void x87_compare(X86Context& ctx, double a, double b) {
 // TOP lives in status word bits 11 to 13
 inline uint16_t x87_status(X86Context& ctx) { return uint16_t((ctx.fsw & ~0x3800) | ((ctx.top & 7) << 11)); }
 
+// round half to even whatever rounding the host runs in (it follows the guest MXCSR, see x86_set_mxcsr)
+inline double x86_round_even(double v) {
+    double f = std::floor(v), d = v - f;  // exact
+    if (d > 0.5 || (d == 0.5 && std::fmod(f, 2.0) != 0.0)) f += 1.0;
+    return f;
+}
+
 inline double x87_round(X86Context& ctx, double v) {
     switch ((ctx.fcw >> 10) & 3) {  // control word RC field
-        case 0: return std::nearbyint(v);
+        case 0: return x86_round_even(v);
         case 1: return std::floor(v);
         case 2: return std::ceil(v);
         default: return std::trunc(v);
@@ -194,6 +201,54 @@ inline uint32_t sse_cmp(float a, float b, int pred) {
     }
     return r ? 0xFFFFFFFFu : 0u;
 }
+
+// The guest's MXCSR rounding and flush to zero bits live in the host MXCSR while guest code runs: generated code does
+// its SSE arithmetic with host instructions, so a title that sets truncation (CoD2: Big Red One, at boot) rounds as on
+// the Xbox, and float tricks that depend on it (adding and subtracting 1.5 * 2^23 to round) give the same results.
+// Host code (HLE, kernel, backends) runs with round to nearest: X86HostFp around it, X86GuestFp around guest calls.
+constexpr uint32_t kX86CsrGuestBits = 0xE040;  // RC, FZ, DAZ; the host keeps its exception masks
+inline uint32_t x86_host_csr() {
+    uint32_t v = 0x1F80;
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
+    __asm__ volatile("stmxcsr %0" : "=m"(v));
+#endif
+    return v;
+}
+inline void x86_host_csr(uint32_t v) {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
+    __asm__ volatile("ldmxcsr %0" : : "m"(v));
+#else
+    (void)v;
+#endif
+}
+// ldmxcsr
+inline void x86_set_mxcsr(X86Context& ctx, uint32_t v) {
+    ctx.mxcsr = v;
+    x86_host_csr((x86_host_csr() & ~kX86CsrGuestBits) | (v & kX86CsrGuestBits));
+}
+struct X86HostFp {
+    uint32_t saved = x86_host_csr();
+    X86HostFp() {
+        if (saved & kX86CsrGuestBits) x86_host_csr(saved & ~kX86CsrGuestBits);
+    }
+    ~X86HostFp() {
+        if (saved & kX86CsrGuestBits) x86_host_csr(saved);
+    }
+    X86HostFp(const X86HostFp&) = delete;
+    X86HostFp& operator=(const X86HostFp&) = delete;
+};
+struct X86GuestFp {
+    uint32_t saved, want;
+    explicit X86GuestFp(const X86Context& ctx)
+        : saved(x86_host_csr()), want((saved & ~kX86CsrGuestBits) | (ctx.mxcsr & kX86CsrGuestBits)) {
+        if (want != saved) x86_host_csr(want);
+    }
+    ~X86GuestFp() {
+        if (want != saved) x86_host_csr(saved);
+    }
+    X86GuestFp(const X86GuestFp&) = delete;
+    X86GuestFp& operator=(const X86GuestFp&) = delete;
+};
 
 inline int32_t sse_cvt(float v) {
     float r = std::nearbyint(v);

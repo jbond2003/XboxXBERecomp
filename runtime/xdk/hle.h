@@ -100,7 +100,11 @@ inline uint32_t Call(X86Context& ctx, uint32_t fn, const Map& m, std::initialize
     X86_FUNC(guest) {                                    \
         (void)base;                                      \
         A args{ctx};                                     \
-        uint32_t r = fn(ctx, args);                      \
+        uint32_t r;                                      \
+        {                                                \
+            X86HostFp host_fp;                           \
+            r = fn(ctx, args);                           \
+        }                                                \
         ::kernel::Return(ctx, r, pops);                  \
     }                                                    \
     static uint32_t fn([[maybe_unused]] X86Context& ctx, [[maybe_unused]] const A& a)
@@ -129,7 +133,10 @@ inline uint32_t Call(X86Context& ctx, uint32_t fn, const Map& m, std::initialize
     X86_EXTERN_FUNC(orig);                           \
     static void fn(X86Context& ctx, const A& a);     \
     X86_FUNC(guest) {                                \
-        fn(ctx, A{ctx});                             \
+        {                                            \
+            X86HostFp host_fp;                       \
+            fn(ctx, A{ctx});                         \
+        }                                            \
         orig(ctx, base);                             \
     }                                                \
     static void fn([[maybe_unused]] X86Context& ctx, [[maybe_unused]] const A& a)
