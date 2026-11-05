@@ -37,6 +37,7 @@
 #include "gpu/ext.h"
 #include "gpu/shaders.h"
 #include "gpu/texture.h"
+#include "gpu/texture_override.h"
 #include "gpu/texturedumper.h"
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
@@ -346,7 +347,7 @@ struct Tex {
     uint8_t flags = 0;  // Extension::Decoded's
     const Tex* swap = nullptr;  // the texture pack's image drawn in its place
     uint64_t pack_key = 0;      // its pack image is still loading
-    uint32_t pack_gen = 0;      // texturedumper::Generation the key was taken at, 0 after new bytes
+    uint32_t pack_gen = 0;      // latch_gen_ the key was taken at, 0 after new bytes
 };
 
 struct PsoKey {
@@ -562,6 +563,7 @@ private:
     void LatchPackImage(Tex& tx);
     void CreatePackTexture(Tex& r, const texturedumper::Image& img);
     void ReleasePackTextures();
+    const Tex* OverrideTexture(std::shared_ptr<const texture_override::Picture> pic);
     void EnsurePixelShader(const PixelKey& pk, DrawShaders& sh);
     void BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k);
     void KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k);
@@ -738,6 +740,14 @@ private:
     DrawBinds binds_;
     std::unordered_map<uint64_t, Tex> textures_;  // by data address, a P8 texture's with its palette's above
     std::unordered_map<uint64_t, Tex> pack_textures_;  // texture pack images by key, kept for the run
+    // the title's own pictures (texture_override), until what it gives changes
+    std::unordered_map<const texture_override::Picture*, std::pair<std::shared_ptr<const texture_override::Picture>, Tex>>
+        override_textures_;
+    // moves when the texture pack's settings or the title's pictures do: each texture is looked up again
+    uint32_t latch_gen_ = 1;
+    uint32_t dump_gen_ = 0;
+    uint32_t override_ver_ = 0;
+    float override_scale_ = 0;
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> blit_psos_;
     Extension* ext_ = nullptr;
     // one frame capture: every draw in a text file, each target as the frame leaves it, the textures it read
@@ -1928,7 +1938,7 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
             tx.pack_gen = 0;
         }
     }
-    if (tx.pack_gen != texturedumper::Generation()) LatchPackKey(tx, d, fi, colours);
+    if (tx.pack_gen != latch_gen_) LatchPackKey(tx, d, fi, colours);
     if (tx.pack_key) LatchPackImage(tx);
     const Tex& drawn = tx.swap ? *tx.swap : tx;
     FillTextureView(drawn, d, stages.sv[stage]);
@@ -1940,12 +1950,36 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
 // after new bytes or a texture setting change: the name the pack and the dumps know the bytes by
 void D3D12Backend::LatchPackKey(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint32_t* colours) {
     const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
-    tx.pack_gen = texturedumper::Generation();
+    tx.pack_gen = latch_gen_;
     tx.swap = nullptr;
     uint64_t key = texturedumper::Key(d, fi, p, colours);
     texturedumper::Dump(key, d, p, colours);
     // dumping alone keys the bytes too: the pack image is not drawn then
     tx.pack_key = texturedumper::Replacing() ? key : 0;
+    // the title's own picture comes before the pack's
+    if (auto pic = texture_override::Find(d, p, scale_)) {
+        tx.swap = OverrideTexture(std::move(pic));
+        tx.pack_key = 0;
+    }
+}
+
+// a GPU copy of the title's picture, made once for each picture it hands out
+const Tex* D3D12Backend::OverrideTexture(std::shared_ptr<const texture_override::Picture> pic) {
+    auto it = override_textures_.find(pic.get());
+    if (it == override_textures_.end()) {
+        texturedumper::Image img;
+        img.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        img.width = pic->width;
+        img.height = pic->height;
+        img.levels.resize(1);
+        img.levels[0].pitch = pic->width * 4;
+        img.levels[0].px.resize(pic->argb.size() * 4);
+        std::memcpy(img.levels[0].px.data(), pic->argb.data(), img.levels[0].px.size());  // 0xAARRGGBB is BGRA in memory
+        const texture_override::Picture* id = pic.get();
+        it = override_textures_.emplace(id, std::make_pair(std::move(pic), Tex{})).first;
+        CreatePackTexture(it->second.second, img);
+    }
+    return it->second.second.res ? &it->second.second : nullptr;
 }
 
 // the pack image for tx's bytes once it has loaded; textures with the same bytes share its GPU copy
@@ -3480,6 +3514,19 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
 void D3D12Backend::ApplySettings() {
     if (texturedumper::Update()) ReleasePackTextures();
     float want = app::RenderScale(guest_h_);
+    // a new pack setting, new pictures from the title or a new output size: every texture lets go of its old copy and
+    // looks again before it draws
+    uint32_t dump_gen = texturedumper::Generation(), override_ver = texture_override::Version();
+    if (dump_gen != dump_gen_ || override_ver != override_ver_ || want != override_scale_) {
+        if (override_ver != override_ver_ || want != override_scale_) {
+            for (auto& entry : override_textures_) CurrentFrame().garbage.push_back(entry.second.second.res);
+            override_textures_.clear();
+        }
+        dump_gen_ = dump_gen;
+        override_ver_ = override_ver;
+        override_scale_ = want;
+        latch_gen_++;
+    }
     bool remake = ext_ && ext_->Settings();
     if (std::fabs(want - scale_) > 1e-4f || remake) {
         Flush();

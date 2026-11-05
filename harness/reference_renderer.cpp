@@ -17,6 +17,7 @@
 #include "core/log.h"
 #include "gpu/shaders.h"
 #include "gpu/texture.h"
+#include "gpu/texture_override.h"
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
@@ -201,6 +202,12 @@ void DecodeBlocks(const TextureDesc& d, Host host, const std::vector<uint8_t>& i
 std::shared_ptr<Image> FindImage(uint32_t header) {
     TextureDesc d;
     if (!header || !Describe(header, d)) return nullptr;
+    // the title's pictures changed: the images made with the old ones go
+    static uint32_t override_ver = 0;
+    if (uint32_t v = texture_override::Version(); v != override_ver) {
+        override_ver = v;
+        g_images.clear();
+    }
     uint64_t key = uint64_t(d.data) << 32 ^ uint64_t(d.format) << 24 ^ uint64_t(d.width) << 12 ^ d.height ^ (d.cube ? 1ull << 63 : 0);
     if (auto it = g_images.find(key); it != g_images.end()) return it->second;
     auto img = std::make_shared<Image>();
@@ -235,6 +242,17 @@ std::shared_ptr<Image> FindImage(uint32_t header) {
                 const uint8_t* p = &raw[size_t(y) * pitch + x * 4];
                 out[size_t(y) * d.width + x] = V(p[2] / 255.f, p[1] / 255.f, p[0] / 255.f, p[3] / 255.f);
             }
+    }
+    // the title's own picture in its place (texture_override)
+    if (auto pic = texture_override::Find(d, guest, 1.0f)) {
+        img->w = pic->width;
+        img->h = pic->height;
+        img->texels[0].resize(pic->argb.size());
+        for (size_t i = 0; i < pic->argb.size(); i++) {
+            uint32_t c = pic->argb[i];
+            img->texels[0][i] = V(float(c >> 16 & 0xFF) / 255.f, float(c >> 8 & 0xFF) / 255.f, float(c & 0xFF) / 255.f,
+                                  float(c >> 24) / 255.f);
+        }
     }
     g_images[key] = img;
     return img;

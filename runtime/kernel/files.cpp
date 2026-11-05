@@ -322,6 +322,19 @@ bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) {
     return true;
 }
 
+bool ReadGameFile(const std::string& xbox_path, uint64_t pos, uint32_t len, std::vector<uint8_t>& out) {
+    Target t = Resolve(xbox_path, 0);
+    out.resize(len);
+    if (t.disc) {
+        if (!t.entry || t.entry->dir) return false;
+        return MountedDisc()->Read(*t.entry, pos, out.data(), len) == len;
+    }
+    std::ifstream f(t.host, std::ios::binary);
+    if (!f || !f.seekg(std::streamoff(pos))) return false;
+    f.read(reinterpret_cast<char*>(out.data()), std::streamsize(len));
+    return uint64_t(f.gcount()) == len;
+}
+
 // exports
 
 KERNEL_EXPORT(190, NtCreateFile, 9) {
