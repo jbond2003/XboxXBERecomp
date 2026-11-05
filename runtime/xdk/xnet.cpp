@@ -24,6 +24,12 @@
 #include "app/app.h"
 #include "xdk/hle.h"
 
+// configs written before the SDK knew the name
+#ifndef SYM_XOnlineGetUsers
+#define SYM_XOnlineGetUsers FFFFFB00
+#define HAS_XOnlineGetUsers 0
+#endif
+
 using kernel::HostPtr;
 using kernel::R32;
 using kernel::W32;
@@ -376,6 +382,11 @@ HLE_STDCALL(WSAStartup, 2) {
 }
 HLE_STDCALL(XNetGetEthernetLinkStatus, 0) { return kLinkUp; }
 HLE_STDCALL(XOnlineStartup, 1) { return 0; }
+// (users, count): no Live accounts on the hard disk. UIX's Live engine lists them while it starts (Big Red One 0xD385B)
+HLE_STDCALL(XOnlineGetUsers, 2) {
+    if (a[1]) W32(a[1], 0);
+    return 0;
+}
 HLE_STDCALL(XOnlineCleanup, 0) { return 0; }
 HLE_STDCALL(WSAGetLastError, 0) { return t_error; }
 

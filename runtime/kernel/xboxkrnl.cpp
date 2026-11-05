@@ -992,8 +992,8 @@ KERNEL_EXPORT(269, RtlCompareMemoryUlong, 3) {
     return n;
 }
 
-KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
-    switch (a[0]) {
+static uint32_t DosError(uint32_t status) {
+    switch (status) {
         case kSuccess: return 0;
         case kPending: return 997;
         case kTimeout: return 1460;
@@ -1016,8 +1016,18 @@ KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
         case kNotADirectory: return 267;
         case 0xC000007F: return 112;  // disk full
         case kDeviceNotConnected: return 1167;
-        default: return (a[0] & 0xC0000000) ? 317 : 0;
+        default: return (status & 0xC0000000) ? 317 : 0;
     }
+}
+
+KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) { return DosError(a[0]); }
+
+// (completion routine, io status block, reserved): the APC XAPI's ReadFileEx and WriteFileEx queue; calls
+// routine(error, bytes, overlapped), the OVERLAPPED starting with the io status block
+KERNEL_EXPORT(232, NtUserIoApcDispatcher, 3) {
+    uint32_t routine = a[0], iosb = a[1];
+    if (routine) CallGuest(ctx, routine, {DosError(R32(iosb)), R32(iosb + 4), iosb});
+    return 0;
 }
 
 // exceptions, debug, shutdown
