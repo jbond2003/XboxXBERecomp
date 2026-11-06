@@ -10,6 +10,10 @@
 #define SYM_XInputGetCapabilities FFFFFC00
 #define HAS_XInputGetCapabilities 0
 #endif
+#ifndef SYM_XGetFilePhysicalSortKey
+#define SYM_XGetFilePhysicalSortKey FFFFFC01
+#define HAS_XGetFilePhysicalSortKey 0
+#endif
 
 using namespace kernel;
 
@@ -43,6 +47,10 @@ struct Handle {
 std::unordered_map<uint32_t, Handle> g_handles;
 
 }  // namespace
+
+// (file): where the file lies on its volume, to order reads. The library asks IoQueryVolumeInformation and reads the
+// file system's own objects; host files have no such place, so every file sorts the same (Big Red One 0xCBB1A).
+HLE_STDCALL(XGetFilePhysicalSortKey, 1) { return 0; }
 
 HLE_STDCALL(XMountUtilityDrive, 1) {
     CreateSymbolicLink("\\??\\Z:", "\\Device\\Harddisk0\\Partition5");

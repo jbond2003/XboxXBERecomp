@@ -103,5 +103,7 @@ extern const GameInfo kGame;
 
 // sleeps out the rest of the frame for the fps cap
 void Pace();
+// the next Pace holds that frame to at most fps, for titles that show one movie frame a frame
+void LimitNextFrame(uint32_t fps);
 
 }  // namespace app

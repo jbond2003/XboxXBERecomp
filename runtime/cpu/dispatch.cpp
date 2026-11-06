@@ -172,6 +172,7 @@ void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
             if (i < dispatch::g_host_thunks.size()) f = dispatch::g_host_thunks[i];
         }
         if (f) {
+            X86HostFp host_fp;
             f(ctx, base);
             return;
         }
@@ -189,6 +190,7 @@ void x86_resume(X86Context& ctx, uint8_t* base, const X86Resume& r) {
 
 void x86_kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal) {
     if (ordinal < 400 && g_exports[ordinal].fn) {
+        X86HostFp host_fp;
         g_exports[ordinal].fn(ctx, base);
         return;
     }
@@ -233,7 +235,10 @@ uint32_t CallGuest(X86Context& ctx, uint32_t fn, const uint32_t* args, size_t co
     }
     ctx.esp -= 4;
     W32(ctx.esp, 0xFFFFFFF0u);  // never used as a target, calls return through the host stack
-    x86_icall(ctx, g_base, fn);
+    {
+        X86GuestFp guest_fp(ctx);
+        x86_icall(ctx, g_base, fn);
+    }
     uint32_t result = ctx.eax;
     ctx.eax = saved.eax;
     ctx.ecx = saved.ecx;

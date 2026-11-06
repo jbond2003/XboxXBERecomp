@@ -365,7 +365,7 @@ bool CodeGen::EmitSse(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
         case ZYDIS_MNEMONIC_MOVMSKPS:
             emit(RegWrite(ops[0].reg.value, F("(ctx.xmm[%d].u[0] >> 31) | (ctx.xmm[%d].u[1] >> 31) << 1 | (ctx.xmm[%d].u[2] >> 31) << 2 | (ctx.xmm[%d].u[3] >> 31) << 3", s, s, s, s)));
             return true;
-        case ZYDIS_MNEMONIC_LDMXCSR: emit("ctx.mxcsr = X86_MEM32(ea);"); return true;
+        case ZYDIS_MNEMONIC_LDMXCSR: emit("x86_set_mxcsr(ctx, X86_MEM32(ea));"); return true;
         case ZYDIS_MNEMONIC_STMXCSR: emit("X86_MEM32(ea) = ctx.mxcsr;"); return true;
         default:
             return false;

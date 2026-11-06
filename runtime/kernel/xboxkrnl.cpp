@@ -375,7 +375,13 @@ KERNEL_EXPORT(175, MmLockUnlockBufferPages, 3) { return 0; }
 KERNEL_EXPORT(176, MmLockUnlockPhysicalPage, 2) { return 0; }
 KERNEL_EXPORT(180, MmQueryAllocationSize, 1) { return mem::AllocationSize(a[0]); }
 KERNEL_EXPORT(182, MmSetAddressProtect, 3) { return 0; }
-KERNEL_EXPORT(179, MmQueryAddressProtect, 1) { return 4; }  // PAGE_READWRITE
+// PAGE_READWRITE, except stack pages: a stack's top and the guard below the next one answer 0 (no access), as titles
+// find their stack's end by stepping up until a page is not read/write (Big Red One 0x93A10)
+KERNEL_EXPORT(179, MmQueryAddressProtect, 1) {
+    uint32_t va = a[0];
+    if (va >= mem::kStackBase && va - mem::kStackBase < mem::kStackSize) return mem::IsCommitted(va) ? 4 : 0;
+    return 4;
+}
 KERNEL_EXPORT(167, MmAllocateSystemMemory, 2) { return mem::AllocSystem(a[0], 0x1000); }
 KERNEL_EXPORT(172, MmFreeSystemMemory, 2) {
     mem::FreeSystem(a[0]);
@@ -986,8 +992,8 @@ KERNEL_EXPORT(269, RtlCompareMemoryUlong, 3) {
     return n;
 }
 
-KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
-    switch (a[0]) {
+static uint32_t DosError(uint32_t status) {
+    switch (status) {
         case kSuccess: return 0;
         case kPending: return 997;
         case kTimeout: return 1460;
@@ -1010,8 +1016,18 @@ KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
         case kNotADirectory: return 267;
         case 0xC000007F: return 112;  // disk full
         case kDeviceNotConnected: return 1167;
-        default: return (a[0] & 0xC0000000) ? 317 : 0;
+        default: return (status & 0xC0000000) ? 317 : 0;
     }
+}
+
+KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) { return DosError(a[0]); }
+
+// (completion routine, io status block, reserved): the APC XAPI's ReadFileEx and WriteFileEx queue; calls
+// routine(error, bytes, overlapped), the OVERLAPPED starting with the io status block
+KERNEL_EXPORT(232, NtUserIoApcDispatcher, 3) {
+    uint32_t routine = a[0], iosb = a[1];
+    if (routine) CallGuest(ctx, routine, {DosError(R32(iosb)), R32(iosb + 4), iosb});
+    return 0;
 }
 
 // exceptions, debug, shutdown

@@ -85,6 +85,26 @@ X86Func* Find(uint32_t guest);
 #define SYM_IDirectSoundBuffer_SetEG FFFFFF0E
 #define HAS_IDirectSoundBuffer_SetEG 0
 #endif
+#ifndef SYM_CDirectSoundStream_SetAllParameters
+#define SYM_CDirectSoundStream_SetAllParameters FFFFFF10
+#define HAS_CDirectSoundStream_SetAllParameters 0
+#endif
+#ifndef SYM_CDirectSoundStream_SetMode
+#define SYM_CDirectSoundStream_SetMode FFFFFF11
+#define HAS_CDirectSoundStream_SetMode 0
+#endif
+#ifndef SYM_CDirectSoundStream_SetRolloffCurve
+#define SYM_CDirectSoundStream_SetRolloffCurve FFFFFF12
+#define HAS_CDirectSoundStream_SetRolloffCurve 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetMode
+#define SYM_IDirectSoundBuffer_SetMode FFFFFF13
+#define HAS_IDirectSoundBuffer_SetMode 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_PlayEx
+#define SYM_IDirectSoundBuffer_PlayEx FFFFFF14
+#define HAS_IDirectSoundBuffer_PlayEx 0
+#endif
 
 namespace {
 
@@ -755,7 +775,9 @@ static void AuditExports() {
         SYM(CDirectSoundStream_SetFrequency), SYM(CDirectSoundStream_SetFilter), SYM(CDirectSoundStream_SetHeadroom),
         SYM(CDirectSoundStream_SetMixBinVolumes), SYM(CDirectSoundStream_SetMixBins), SYM(CDirectSoundStream_SetMaxDistance),
         SYM(CDirectSoundStream_SetMinDistance), SYM(CDirectSoundStream_SetPosition), SYM(CDirectSoundStream_SetVelocity),
-        SYM(CDirectSoundStream_SetI3DL2Source), SYM(IDirectSoundStream_SetEG)};
+        SYM(CDirectSoundStream_SetI3DL2Source), SYM(IDirectSoundStream_SetEG), SYM(CDirectSoundStream_SetAllParameters),
+        SYM(CDirectSoundStream_SetMode), SYM(CDirectSoundStream_SetRolloffCurve), SYM(IDirectSoundBuffer_SetMode),
+        SYM(IDirectSoundBuffer_PlayEx)};
     std::string left;
     // the library's own section: the WMA decoder shares the export ids and touches no DSOUND object
     uint32_t lo = 0, hi = 0;
@@ -975,6 +997,20 @@ BUFFER(Play, 4) {
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
     v.sync = a[3] & 4;
+    return 0;
+}
+// (this, time low, time high, flags): plays now
+BUFFER(PlayEx, 4) {
+    v.has_gain = false;
+    v.playing = true;
+    v.looping = a[3] & 1;
+    if (a[3] & 2) v.pos = 0;
+    v.sync = a[3] & 4;
+    return 0;
+}
+// (this, mode, apply)
+BUFFER(SetMode, 3) {
+    v.mode = a[1];
     return 0;
 }
 BUFFER(Stop, 1) {
@@ -1247,4 +1283,22 @@ STREAM(SetPosition, 5) {
     return 0;
 }
 STREAM(SetVelocity, 5) { return 0; }
+// (this, DS3DBUFFER, apply) as the buffer's
+STREAM(SetAllParameters, 3) {
+    for (int i = 0; i < 3; i++) v.p[i] = F32(R32(a[1] + 4 + i * 4));
+    v.min_dist = F32(R32(a[1] + 0x34));
+    v.max_dist = F32(R32(a[1] + 0x38));
+    v.mode = R32(a[1] + 0x3C);
+    return 0;
+}
+STREAM(SetMode, 3) {
+    v.mode = a[1];
+    return 0;
+}
+// (this, points, count, apply)
+STREAM(SetRolloffCurve, 4) {
+    v.curve.clear();
+    for (uint32_t i = 0; a[1] && i < std::min<uint32_t>(a[2], 64); i++) v.curve.push_back(F32(R32(a[1] + i * 4)));
+    return 0;
+}
 STREAM(SetI3DL2Source, 3) { return 0; }

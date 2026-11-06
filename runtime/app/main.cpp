@@ -10,6 +10,7 @@
 #include <timeapi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cwchar>
@@ -228,12 +229,20 @@ uint32_t RefreshRate() {
 
 }  // namespace
 
+namespace {
+std::atomic<uint32_t> g_next_limit{0};
+}  // namespace
+
+void LimitNextFrame(uint32_t fps) { g_next_limit = fps; }
+
 void Pace() {
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
     uint32_t cap = Get().fps_cap;
     uint32_t refresh = RefreshRate();
     if (cap == kFpsCapRefresh) cap = refresh;
+    uint32_t limit = g_next_limit.exchange(0);
+    if (limit && (!cap || cap > limit)) cap = limit;
     // with vertical sync on, a cap at or above the refresh rate is the display's own pace: a second, timer based
     // limiter beside it beats against the real blanks (the mode's whole hertz, 143 or 144 for 143.98, never quite
     // matches) and repeats or drops a frame every second or so
