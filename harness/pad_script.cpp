@@ -1,6 +1,7 @@
 // pad 0 from a script, then GameInfo::pad as on Windows
 // SCRIPT file: lines of "frame buttons [frames held]", held 8 frames by default, # comments; buttons joined by +:
-// UP DOWN LEFT RIGHT START BACK A B X Y BLACK WHITE LT RT LS LSD LSL LSR (left stick up, down, left, right)
+// UP DOWN LEFT RIGHT START BACK A B X Y BLACK WHITE LT RT L3 R3 (stick clicks) LS LSD LSL LSR (left stick up, down,
+// left, right)
 // cmd in the run folder: "buttons [frames held]" pressed once from the frame it is read, then removed
 #include <cstdio>
 #include <string>
@@ -58,6 +59,8 @@ void Apply(const std::string& s, Pad& p) {
         else if (b == "BLACK") p.analog[4] = 255;
         else if (b == "WHITE") p.analog[5] = 255;
         else if (b == "RT") p.analog[7] = 255;
+        else if (b == "L3") p.buttons |= 0x40;
+        else if (b == "R3") p.buttons |= 0x80;
         else if (b == "LS") p.ly = 32767;
         else if (b == "LSD") p.ly = -32767;
         else if (b == "LSL") p.lx = -32767;
