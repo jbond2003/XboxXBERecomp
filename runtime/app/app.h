@@ -47,10 +47,13 @@ bool Widescreen();
 // The part of the frame that is shown: a title whose menus sit in a band of the frame, with black above and below,
 // shows only the band. top and bottom are fractions of the frame's height (0 and 1: all of it, as ever). The band
 // keeps its shape (the frame is a 4:3 picture): on a window less wide than the band, up to `side` of the frame's
-// width is left out at each side to fill it, and bars above and below make up the rest; on a wider one, bars beside.
+// width is left out at each side to fill it, then it is stretched by up to `stretch` (0.1: a tenth), and bars make
+// up the rest; on a wider one, the stretch and bars beside.
 inline std::atomic<float> g_frame_band_top{0.0f}, g_frame_band_bottom{1.0f}, g_frame_band_side{0.0f};
-inline void SetFrameBand(float top, float bottom, float side = 0.0f) {
-    bool ok = top >= 0.0f && bottom <= 1.0f && bottom - top > 0.1f && side >= 0.0f && side < 0.4f;
+inline std::atomic<float> g_frame_band_stretch{0.0f};
+inline void SetFrameBand(float top, float bottom, float side = 0.0f, float stretch = 0.0f) {
+    bool ok = top >= 0.0f && bottom <= 1.0f && bottom - top > 0.1f && side >= 0.0f && side < 0.4f && stretch >= 0.0f;
+    g_frame_band_stretch.store(ok ? stretch : 0.0f, std::memory_order_relaxed);
     g_frame_band_top.store(ok ? top : 0.0f, std::memory_order_relaxed);
     g_frame_band_bottom.store(ok ? bottom : 1.0f, std::memory_order_relaxed);
     g_frame_band_side.store(ok ? side : 0.0f, std::memory_order_relaxed);
@@ -72,8 +75,16 @@ inline bool FrameBandView(float width, float height, FrameView& out) {
         if (cut > most) cut = most;
     }
     shape *= 1.0f - 2.0f * cut;
-    out.w = window < shape ? width : height * shape;
-    out.h = out.w / shape;
+    float stretch = 1.0f + g_frame_band_stretch.load(std::memory_order_relaxed);
+    if (window < shape) {
+        out.w = width;
+        out.h = width / shape * stretch;
+        if (out.h > height) out.h = height;
+    } else {
+        out.h = height;
+        out.w = height * shape * stretch;
+        if (out.w > width) out.w = width;
+    }
     out.x = (width - out.w) / 2.0f, out.y = (height - out.h) / 2.0f;
     out.u = cut, out.v = top, out.uw = 1.0f - 2.0f * cut, out.vh = bottom - top;
     return true;
