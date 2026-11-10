@@ -233,7 +233,11 @@ namespace {
 std::atomic<uint32_t> g_next_limit{0};
 }  // namespace
 
-void LimitNextFrame(uint32_t fps) { g_next_limit = fps; }
+// (the lowest asked for the frame: a movie's 30 holds beside a menu's 60)
+void LimitNextFrame(uint32_t fps) {
+    uint32_t now = g_next_limit.load();
+    while ((!now || fps < now) && !g_next_limit.compare_exchange_weak(now, fps)) {}
+}
 
 void Pace() {
     using clock = std::chrono::steady_clock;
