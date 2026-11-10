@@ -3326,6 +3326,7 @@ void D3D12Backend::BlitFrame(Target& t) {
     float vh = vw / aspect;
     float band_top, band_bottom;
     app::FrameBand(band_top, band_bottom);  // the title shows a band of the frame only (its menus' own black bars cut)
+    if (band_top > 0.0f || band_bottom < 1.0f) vw = w, vh = h;  // and the band fills the window, whatever its shape
     float uv[4] = {0, band_top, 1, band_bottom - band_top};
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};

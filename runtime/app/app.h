@@ -45,7 +45,7 @@ float RenderScale(uint32_t guest_height);
 // the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9, else 4:3 as on a 4:3 TV
 bool Widescreen();
 // the part of the frame that is shown, its top and bottom as fractions of the frame's height (0 and 1: all of it). A
-// title whose menus sit in a band of the frame with black above and below shows only the band, over the whole picture
+// title whose menus sit in a band of the frame with black above and below shows only the band, over the whole window
 inline std::atomic<float> g_frame_band_top{0.0f}, g_frame_band_bottom{1.0f};
 inline void SetFrameBand(float top, float bottom) {
     bool ok = top >= 0.0f && bottom <= 1.0f && bottom - top > 0.1f;
