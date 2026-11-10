@@ -44,17 +44,39 @@ Mode Output();
 float RenderScale(uint32_t guest_height);
 // the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9, else 4:3 as on a 4:3 TV
 bool Widescreen();
-// the part of the frame that is shown, its top and bottom as fractions of the frame's height (0 and 1: all of it). A
-// title whose menus sit in a band of the frame with black above and below shows only the band, over the whole window
-inline std::atomic<float> g_frame_band_top{0.0f}, g_frame_band_bottom{1.0f};
-inline void SetFrameBand(float top, float bottom) {
-    bool ok = top >= 0.0f && bottom <= 1.0f && bottom - top > 0.1f;
+// The part of the frame that is shown: a title whose menus sit in a band of the frame, with black above and below,
+// shows only the band. top and bottom are fractions of the frame's height (0 and 1: all of it, as ever). The band
+// keeps its shape (the frame is a 4:3 picture): on a window less wide than the band, up to `side` of the frame's
+// width is left out at each side to fill it, and bars above and below make up the rest; on a wider one, bars beside.
+inline std::atomic<float> g_frame_band_top{0.0f}, g_frame_band_bottom{1.0f}, g_frame_band_side{0.0f};
+inline void SetFrameBand(float top, float bottom, float side = 0.0f) {
+    bool ok = top >= 0.0f && bottom <= 1.0f && bottom - top > 0.1f && side >= 0.0f && side < 0.4f;
     g_frame_band_top.store(ok ? top : 0.0f, std::memory_order_relaxed);
     g_frame_band_bottom.store(ok ? bottom : 1.0f, std::memory_order_relaxed);
+    g_frame_band_side.store(ok ? side : 0.0f, std::memory_order_relaxed);
 }
-inline void FrameBand(float& top, float& bottom) {
-    top = g_frame_band_top.load(std::memory_order_relaxed);
-    bottom = g_frame_band_bottom.load(std::memory_order_relaxed);
+struct FrameView {
+    float x, y, w, h;      // where in the window (width by height) the part is shown
+    float u, v, uw, vh;    // the part: its corner and size as fractions of the frame
+};
+// false when the whole frame is shown (no band set)
+inline bool FrameBandView(float width, float height, FrameView& out) {
+    float top = g_frame_band_top.load(std::memory_order_relaxed);
+    float bottom = g_frame_band_bottom.load(std::memory_order_relaxed);
+    if ((top <= 0.0f && bottom >= 1.0f) || width <= 0.0f || height <= 0.0f) return false;
+    float shape = (4.0f / 3.0f) / (bottom - top), window = width / height;
+    float cut = 0.0f;
+    if (window < shape) {
+        float most = g_frame_band_side.load(std::memory_order_relaxed);
+        cut = (1.0f - window / shape) / 2.0f;
+        if (cut > most) cut = most;
+    }
+    shape *= 1.0f - 2.0f * cut;
+    out.w = window < shape ? width : height * shape;
+    out.h = out.w / shape;
+    out.x = (width - out.w) / 2.0f, out.y = (height - out.h) / 2.0f;
+    out.u = cut, out.v = top, out.uw = 1.0f - 2.0f * cut, out.vh = bottom - top;
+    return true;
 }
 
 std::filesystem::path ExeDir();
