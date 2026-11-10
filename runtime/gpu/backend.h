@@ -1,10 +1,7 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
-#include <filesystem>
 #include <memory>
-#include <mutex>
-#include <optional>
 
 #include "gpu/state.h"
 
@@ -72,26 +69,5 @@ inline std::atomic<uint64_t> g_perf_sync_late{0}, g_perf_sync_block{0};  // read
 
 // F3: save the next frame, every draw and target, under diag::CaptureDir
 inline std::atomic<bool> g_capture{false};
-
-// A title asks for a picture of the next frame presented, as a 32 bit .bmp: the rows from top to bottom of the frame
-// (fractions of its height), `width` pixels wide, the frame taken as a 4:3 picture. For one made from the player's own
-// game, as a boot splash of the title's own first screen.
-struct FrameSave {
-    std::filesystem::path path;
-    float top = 0.0f, bottom = 1.0f;
-    uint32_t width = 640;
-};
-inline std::mutex g_frame_save_lock;
-inline std::optional<FrameSave> g_frame_save;
-inline void SaveFrame(FrameSave save) {
-    std::lock_guard lock(g_frame_save_lock);
-    g_frame_save = std::move(save);
-}
-inline std::optional<FrameSave> TakeFrameSave() {
-    std::lock_guard lock(g_frame_save_lock);
-    std::optional<FrameSave> save = std::move(g_frame_save);
-    g_frame_save.reset();
-    return save;
-}
 
 }  // namespace gpu

@@ -617,7 +617,6 @@ private:
     // Present, in call order, each callee right after its caller; DrawFrame runs the two after it
     void FinishCapture(const Surface& front);
     void StartCapture();
-    void SaveFrame(const Surface& front, const FrameSave& save);
     void ResizeSwap();
     void UploadGammaRamp();
     void DrawFrame(Target* t, uint32_t bi);
@@ -3465,7 +3464,6 @@ void D3D12Backend::Present(const Surface& front) {
     } else if (g_capture.exchange(false) && CaptureOn()) {
         StartCapture();
     }
-    if (auto save = TakeFrameSave()) SaveFrame(front, *save);
     ResizeSwap();
     // a hold lasts until a frame draws again, ten seconds at most
     constexpr uint64_t kHoldPresents = 600;
@@ -3776,51 +3774,25 @@ constexpr int kBmpBitCount = 28;
 constexpr int kBmpImageSize = 34;
 constexpr uint32_t kBmpInfoBytes = 40;
 
-// w x h BGRA pixels, rows top down
-static bool WriteBmp(const std::filesystem::path& path, uint32_t w, uint32_t h, const uint8_t* px) {
-    FILE* f = _wfopen(path.c_str(), L"wb");
-    if (!f) return false;
-    uint32_t bytes = w * h * 4;
-    uint8_t hd[kBmpHeaderBytes] = {'B', 'M'};  // BITMAPFILEHEADER and BITMAPINFOHEADER, top down 32 bit
-    auto put = [&](int o, uint32_t v) { std::memcpy(hd + o, &v, 4); };
-    put(kBmpFileSize, kBmpHeaderBytes + bytes);
-    put(kBmpPixelOffset, kBmpHeaderBytes);
-    put(kBmpInfoSize, kBmpInfoBytes);
-    put(kBmpWidth, w);
-    put(kBmpHeight, uint32_t(-int32_t(h)));
-    hd[kBmpPlanes] = 1;
-    hd[kBmpBitCount] = 32;
-    put(kBmpImageSize, bytes);
-    bool ok = fwrite(hd, 1, kBmpHeaderBytes, f) == kBmpHeaderBytes && fwrite(px, 1, bytes, f) == bytes;
-    fclose(f);
-    return ok;
-}
-
 void D3D12Backend::CapSave(const CapImage& img, const char* name) {
     ComPtr<ID3D12Resource> down = Shrink(img.res, *img.state, img.fmt, img.w, img.h, {.mul = img.mul});
     std::vector<uint8_t> px;
     if (!down || !ReadBack(down.Get(), img.w, img.h, px)) return;
-    WriteBmp(cap_dir_ / (std::string(name) + ".bmp"), img.w, img.h, px.data());
-}
-
-// gpu::SaveFrame: the frame about to be presented, filtered to the asked width, its rows cut out and made opaque
-void D3D12Backend::SaveFrame(const Surface& front, const FrameSave& save) {
-    Target* t = FindTarget(front, false);
-    uint32_t w = std::clamp<uint32_t>(save.width, 16, 4096), h = w * 3 / 4;
-    uint32_t top = std::min(uint32_t(std::max(save.top, 0.0f) * float(h)), h - 1);
-    uint32_t bottom = std::clamp(uint32_t(std::min(save.bottom, 1.0f) * float(h)), top + 1, h);
-    std::vector<uint8_t> px;
-    ComPtr<ID3D12Resource> down = t ? Shrink(t->res.Get(), t->state, t->fmt, w, h, {.mul = t->range}) : nullptr;
-    if (!down || !ReadBack(down.Get(), w, h, px)) {
-        LOGW("d3d12: no picture of the frame for %s", save.path.filename().string().c_str());
-        return;
-    }
-    for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;
-    std::filesystem::path part = save.path;
-    part += L".part";
-    std::error_code ec;
-    if (WriteBmp(part, w, bottom - top, px.data() + size_t(top) * w * 4)) std::filesystem::rename(part, save.path, ec);
-    LOGR("d3d12: frame saved as %s, %ux%u", save.path.filename().string().c_str(), w, bottom - top);
+    FILE* f = _wfopen((cap_dir_ / (std::string(name) + ".bmp")).c_str(), L"wb");
+    if (!f) return;
+    uint8_t hd[kBmpHeaderBytes] = {'B', 'M'};  // BITMAPFILEHEADER and BITMAPINFOHEADER, top down 32 bit
+    auto put = [&](int o, uint32_t v) { std::memcpy(hd + o, &v, 4); };
+    put(kBmpFileSize, kBmpHeaderBytes + uint32_t(px.size()));
+    put(kBmpPixelOffset, kBmpHeaderBytes);
+    put(kBmpInfoSize, kBmpInfoBytes);
+    put(kBmpWidth, img.w);
+    put(kBmpHeight, uint32_t(-int32_t(img.h)));
+    hd[kBmpPlanes] = 1;
+    hd[kBmpBitCount] = 32;
+    put(kBmpImageSize, uint32_t(px.size()));
+    fwrite(hd, 1, kBmpHeaderBytes, f);
+    fwrite(px.data(), 1, px.size(), f);
+    fclose(f);
 }
 
 void D3D12Backend::CapSave(Target& t, const char* name) {
