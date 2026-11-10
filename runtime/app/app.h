@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
@@ -43,6 +44,18 @@ Mode Output();
 float RenderScale(uint32_t guest_height);
 // the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9, else 4:3 as on a 4:3 TV
 bool Widescreen();
+// the part of the frame that is shown, its top and bottom as fractions of the frame's height (0 and 1: all of it). A
+// title whose menus sit in a band of the frame with black above and below shows only the band, over the whole picture
+inline std::atomic<float> g_frame_band_top{0.0f}, g_frame_band_bottom{1.0f};
+inline void SetFrameBand(float top, float bottom) {
+    bool ok = top >= 0.0f && bottom <= 1.0f && bottom - top > 0.1f;
+    g_frame_band_top.store(ok ? top : 0.0f, std::memory_order_relaxed);
+    g_frame_band_bottom.store(ok ? bottom : 1.0f, std::memory_order_relaxed);
+}
+inline void FrameBand(float& top, float& bottom) {
+    top = g_frame_band_top.load(std::memory_order_relaxed);
+    bottom = g_frame_band_bottom.load(std::memory_order_relaxed);
+}
 
 std::filesystem::path ExeDir();
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc

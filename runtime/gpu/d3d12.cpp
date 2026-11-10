@@ -3324,7 +3324,9 @@ void D3D12Backend::BlitFrame(Target& t) {
     float h = float(bb_h_);
     float vw = std::min(w, h * aspect);
     float vh = vw / aspect;
-    float uv[4] = {0, 0, 1, 1};
+    float band_top, band_bottom;
+    app::FrameBand(band_top, band_bottom);  // the title shows a band of the frame only (its menus' own black bars cut)
+    float uv[4] = {0, band_top, 1, band_bottom - band_top};
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
     cl_->RSSetViewports(1, &vp);
