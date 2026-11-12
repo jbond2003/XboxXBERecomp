@@ -1768,10 +1768,13 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
         UploadTarget(t, su);
     }
     info.kind = kTex2D;
-    // a pass shrinking it averages each tap over a console texel, else upscaled taps skip texels and ghost
+    // a pass shrinking it averages each tap over a console texel, else upscaled taps skip texels and ghost. Shrinking:
+    // the target read holds more texels than the one drawn to. One only taller or wider is a picture laid on the
+    // scene (a 512x512 shadow picture drawn over a 640x480 frame was boxed into a blur, at many taps a pixel).
     Target* rt = FindTarget(s.rt, false);
     float k = float(t.w) / (t.gw * stages.k[stage]);
-    if (!t.depth && box && k > kUpscaledMin && rt && rt != &t && (t.gw > rt->gw || t.gh > rt->gh)) {
+    bool shrinks = rt && (t.gw > rt->gw || t.gh > rt->gh) && uint64_t(t.gw) * t.gh > uint64_t(rt->gw) * rt->gh;
+    if (!t.depth && box && k > kUpscaledMin && rt != &t && shrinks) {
         stages.wide[stage] = k;
         info.flags |= kTexWide;
     }
