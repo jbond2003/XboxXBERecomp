@@ -145,6 +145,18 @@ struct Gains {
     float bin[kRows][kBins];
 };
 
+// a voice's 3D settings
+struct Spot {
+    std::vector<float> curve;  // rolloff
+    uint32_t mode = 0;  // DS3DMODE: 1 head relative, 2 disabled
+    float p[3] = {}, min_dist = 1, max_dist = 1e9f;
+};
+
+// the listener
+struct Ear {
+    float at[3] = {}, front[3] = {0, 0, 1}, top[3] = {0, 1, 0};
+};
+
 struct Voice {
     uint32_t obj = 0;
     bool stream = false;
@@ -168,10 +180,9 @@ struct Voice {
     float volume = 1, headroom = 1;
     uint8_t nbins = 0, bin[8] = {};
     int32_t bin_mb[32] = {};  // by mix bin
-    std::vector<float> curve;  // rolloff
     bool is3d = false;
-    uint32_t mode = 0;  // DS3DMODE: 1 head relative, 2 disabled
-    float p[3] = {}, min_dist = 1, max_dist = 1e9f;
+    // the 3D settings in use, and the ones set since: a deferred setting waits there for the commit
+    Spot spot, next;
     Gains gain = {};  // the last block's gains, the next block ramps from them
     bool has_gain = false;
     // a mono 3D voice's interaural delay in samples and its recent samples
@@ -190,7 +201,10 @@ struct Done {
 
 std::recursive_mutex g_lock;
 std::map<uint32_t, Voice> g_voices;
-float g_listener[3] = {}, g_front[3] = {0, 0, 1}, g_top[3] = {0, 1, 0};
+// DS3D_DEFERRED: the setting waits for IDirectSound_CommitDeferredSettings. A title moves the listener and its
+// voices with it and commits once, so no block is mixed with one moved and the others not.
+constexpr uint32_t kDeferred = 1;
+Ear g_ear, g_ear_next;
 // Completed packets' callbacks, run as the XDK runs them: in DirectSoundDoWork on the title's thread, so they never
 // overlap the title's own stream code. A stream flushed or released runs its own at once, before it is gone.
 std::deque<Done> g_done;
@@ -381,8 +395,10 @@ float Elevation(const float d[3], const float front[3], const float right[3], co
     return up < 0 ? -deg : deg;
 }
 
-// interaural delay in samples by azimuth in steps of 3 degrees at elevation 0, the far ear's HRTF delay
-float Itd(float azimuth) {
+// Interaural delay in samples, the far ear's HRTF delay: by azimuth in steps of 3 degrees at elevation 0, and
+// shorter by the cosine of the elevation, as the library's filters are (18 of 31 samples at 54 degrees, none
+// straight above or below). A sound at the listener's feet has no side.
+float Itd(float azimuth, float elevation) {
     static const uint8_t kDelay[61] = {0,  2,  3,  4,  4,  5,  6,  9,  10, 11, 12, 12, 13, 14, 17, 18,
                                        19, 20, 21, 21, 22, 23, 24, 25, 26, 28, 29, 29, 31, 30, 30, 31,
                                        30, 28, 27, 28, 27, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15,
@@ -390,7 +406,9 @@ float Itd(float azimuth) {
     constexpr int kStep = 3;
     if (!(std::fabs(azimuth) <= 180)) return 0;
     int deg = int(std::fabs(azimuth) + kStep / 2.0f) / kStep * kStep;
-    float delay = kDelay[deg / kStep];
+    constexpr float kRadiansPerDegree = 0.017453293f;
+    float level = std::fabs(elevation) < 90 ? std::cos(elevation * kRadiansPerDegree) : 0.0f;
+    float delay = kDelay[deg / kStep] * level;
     return azimuth < 0 ? -delay : delay;
 }
 
@@ -411,7 +429,7 @@ void ShareCentre(Place& at) {
 }
 
 // distance attenuation, 1.0 inside the min distance: min / distance, or the voice's rolloff curve
-float Attenuation(const Voice& v, float dist) {
+float Attenuation(const Spot& v, float dist) {
     if (dist <= v.min_dist) return 1;
     if (v.curve.empty()) return v.min_dist / std::min(dist, v.max_dist);
     if (v.max_dist <= v.min_dist) return 1;
@@ -427,17 +445,18 @@ Place Locate(const Voice& v) {
     static const float kRight[3] = {1, 0, 0};
     static const float kUp[3] = {0, 1, 0};
     Place at;
-    if (!v.is3d || v.mode == 2) return at;
+    const Spot& sp = v.spot;
+    if (!v.is3d || sp.mode == 2) return at;
     at.on = true;
-    bool relative = v.mode == 1;  // the position is already in listener space
-    float d[3] = {v.p[0], v.p[1], v.p[2]};
-    for (int i = 0; i < 3 && !relative; i++) d[i] -= g_listener[i];
-    at.att = Attenuation(v, std::sqrt(Dot(d, d)));
-    float right[3] = {g_top[1] * g_front[2] - g_top[2] * g_front[1], g_top[2] * g_front[0] - g_top[0] * g_front[2],
-                      g_top[0] * g_front[1] - g_top[1] * g_front[0]};
-    const float* front = relative ? kAhead : g_front;
+    bool relative = sp.mode == 1;  // the position is already in listener space
+    float d[3] = {sp.p[0], sp.p[1], sp.p[2]};
+    for (int i = 0; i < 3 && !relative; i++) d[i] -= g_ear.at[i];
+    at.att = Attenuation(sp, std::sqrt(Dot(d, d)));
+    float right[3] = {g_ear.top[1] * g_ear.front[2] - g_ear.top[2] * g_ear.front[1], g_ear.top[2] * g_ear.front[0] - g_ear.top[0] * g_ear.front[2],
+                      g_ear.top[0] * g_ear.front[1] - g_ear.top[1] * g_ear.front[0]};
+    const float* front = relative ? kAhead : g_ear.front;
     const float* side = relative ? kRight : right;
-    const float* top = relative ? kUp : g_top;
+    const float* top = relative ? kUp : g_ear.top;
     at.azimuth = Azimuth(d, front, side);
     at.elevation = Elevation(d, front, side, top);
     at.centre = at.front;
@@ -584,7 +603,7 @@ std::optional<Cursor> BufferFrame(Voice& v) {
 void MixVoice(Voice& v, float* bins, uint32_t frames) {
     Place at = Locate(v);
     Gains target = Levels(v, at);
-    float itd = Itd(at.azimuth);
+    float itd = Itd(at.azimuth, at.elevation);
     if (!v.has_gain) {
         v.gain = target;
         v.itd = itd;
@@ -831,7 +850,12 @@ HLE_STDCALL(IDirectSound_SetMixBinHeadroom, 3) {
     if (a[1] < kBins) g_bin_headroom[a[1]] = a[2] & 7;
     return 0;
 }
-HLE_STDCALL(IDirectSound_CommitDeferredSettings, 1) { return 0; }
+HLE_STDCALL(IDirectSound_CommitDeferredSettings, 1) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    g_ear = g_ear_next;
+    for (auto& [obj, v] : g_voices) v.spot = v.next;
+    return 0;
+}
 HLE_STDCALL(IDirectSound_SetDopplerFactor, 3) { return 0; }
 HLE_STDCALL(IDirectSound_SetRolloffFactor, 3) { return 0; }
 HLE_STDCALL(IDirectSound_SetDistanceFactor, 3) { return 0; }
@@ -850,15 +874,17 @@ HLE_STDCALL(IDirectSound_SetI3DL2Listener, 3) {
 }
 HLE_STDCALL(IDirectSound_SetPosition, 5) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    for (int i = 0; i < 3; i++) g_listener[i] = F32(a[1 + i]);
+    for (int i = 0; i < 3; i++) g_ear_next.at[i] = F32(a[1 + i]);
+    if (a[4] != kDeferred) g_ear = g_ear_next;
     return 0;
 }
 HLE_STDCALL(IDirectSound_SetOrientation, 8) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     for (int i = 0; i < 3; i++) {
-        g_front[i] = F32(a[1 + i]);
-        g_top[i] = F32(a[4 + i]);
+        g_ear_next.front[i] = F32(a[1 + i]);
+        g_ear_next.top[i] = F32(a[4 + i]);
     }
+    if (a[7] != kDeferred) g_ear = g_ear_next;
     return 0;
 }
 HLE_STDCALL(DirectSoundDoWork, 0) {
@@ -1010,7 +1036,8 @@ BUFFER(PlayEx, 4) {
 }
 // (this, mode, apply)
 BUFFER(SetMode, 3) {
-    v.mode = a[1];
+    v.next.mode = a[1];
+    if (a[2] != kDeferred) v.spot.mode = v.next.mode;
     return 0;
 }
 BUFFER(Stop, 1) {
@@ -1094,31 +1121,36 @@ BUFFER(SetMixBins, 2) {
     return 0;
 }
 BUFFER(SetMaxDistance, 3) {
-    v.max_dist = F32(a[1]);
+    v.next.max_dist = F32(a[1]);
+    if (a[2] != kDeferred) v.spot.max_dist = v.next.max_dist;
     return 0;
 }
 BUFFER(SetMinDistance, 3) {
-    v.min_dist = F32(a[1]);
+    v.next.min_dist = F32(a[1]);
+    if (a[2] != kDeferred) v.spot.min_dist = v.next.min_dist;
     return 0;
 }
 BUFFER(SetPosition, 5) {
-    for (int i = 0; i < 3; i++) v.p[i] = F32(a[1 + i]);
+    for (int i = 0; i < 3; i++) v.next.p[i] = F32(a[1 + i]);
+    if (a[4] != kDeferred) std::copy(v.next.p, v.next.p + 3, v.spot.p);
     return 0;
 }
 BUFFER(SetVelocity, 5) { return 0; }
 BUFFER(SetI3DL2Source, 3) { return 0; }
 // (this, DS3DBUFFER, apply): position at +4, distances at +0x34 and +0x38, mode at +0x3C
 BUFFER(SetAllParameters, 3) {
-    for (int i = 0; i < 3; i++) v.p[i] = F32(R32(a[1] + 4 + i * 4));
-    v.min_dist = F32(R32(a[1] + 0x34));
-    v.max_dist = F32(R32(a[1] + 0x38));
-    v.mode = R32(a[1] + 0x3C);
+    for (int i = 0; i < 3; i++) v.next.p[i] = F32(R32(a[1] + 4 + i * 4));
+    v.next.min_dist = F32(R32(a[1] + 0x34));
+    v.next.max_dist = F32(R32(a[1] + 0x38));
+    v.next.mode = R32(a[1] + 0x3C);
+    if (a[2] != kDeferred) v.spot = v.next;
     return 0;
 }
 // (this, points, count, apply)
 BUFFER(SetRolloffCurve, 4) {
-    v.curve.clear();
-    for (uint32_t i = 0; a[1] && i < std::min<uint32_t>(a[2], 64); i++) v.curve.push_back(F32(R32(a[1] + i * 4)));
+    v.next.curve.clear();
+    for (uint32_t i = 0; a[1] && i < std::min<uint32_t>(a[2], 64); i++) v.next.curve.push_back(F32(R32(a[1] + i * 4)));
+    if (a[3] != kDeferred) v.spot.curve = v.next.curve;
     return 0;
 }
 BUFFER(SetOutputBuffer, 2) { return 0; }  // the voice keeps its own mix bins
@@ -1271,34 +1303,40 @@ STREAM(SetMixBins, 2) {
     return 0;
 }
 STREAM(SetMaxDistance, 3) {
-    v.max_dist = F32(a[1]);
+    v.next.max_dist = F32(a[1]);
+    if (a[2] != kDeferred) v.spot.max_dist = v.next.max_dist;
     return 0;
 }
 STREAM(SetMinDistance, 3) {
-    v.min_dist = F32(a[1]);
+    v.next.min_dist = F32(a[1]);
+    if (a[2] != kDeferred) v.spot.min_dist = v.next.min_dist;
     return 0;
 }
 STREAM(SetPosition, 5) {
-    for (int i = 0; i < 3; i++) v.p[i] = F32(a[1 + i]);
+    for (int i = 0; i < 3; i++) v.next.p[i] = F32(a[1 + i]);
+    if (a[4] != kDeferred) std::copy(v.next.p, v.next.p + 3, v.spot.p);
     return 0;
 }
 STREAM(SetVelocity, 5) { return 0; }
 // (this, DS3DBUFFER, apply) as the buffer's
 STREAM(SetAllParameters, 3) {
-    for (int i = 0; i < 3; i++) v.p[i] = F32(R32(a[1] + 4 + i * 4));
-    v.min_dist = F32(R32(a[1] + 0x34));
-    v.max_dist = F32(R32(a[1] + 0x38));
-    v.mode = R32(a[1] + 0x3C);
+    for (int i = 0; i < 3; i++) v.next.p[i] = F32(R32(a[1] + 4 + i * 4));
+    v.next.min_dist = F32(R32(a[1] + 0x34));
+    v.next.max_dist = F32(R32(a[1] + 0x38));
+    v.next.mode = R32(a[1] + 0x3C);
+    if (a[2] != kDeferred) v.spot = v.next;
     return 0;
 }
 STREAM(SetMode, 3) {
-    v.mode = a[1];
+    v.next.mode = a[1];
+    if (a[2] != kDeferred) v.spot.mode = v.next.mode;
     return 0;
 }
 // (this, points, count, apply)
 STREAM(SetRolloffCurve, 4) {
-    v.curve.clear();
-    for (uint32_t i = 0; a[1] && i < std::min<uint32_t>(a[2], 64); i++) v.curve.push_back(F32(R32(a[1] + i * 4)));
+    v.next.curve.clear();
+    for (uint32_t i = 0; a[1] && i < std::min<uint32_t>(a[2], 64); i++) v.next.curve.push_back(F32(R32(a[1] + i * 4)));
+    if (a[3] != kDeferred) v.spot.curve = v.next.curve;
     return 0;
 }
 STREAM(SetI3DL2Source, 3) { return 0; }
