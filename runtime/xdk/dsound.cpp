@@ -205,6 +205,9 @@ std::map<uint32_t, Voice> g_voices;
 // voices with it and commits once, so no block is mixed with one moved and the others not.
 constexpr uint32_t kDeferred = 1;
 Ear g_ear, g_ear_next;
+// A voice's deferred setting waits only while the voice is being mixed. One not yet heard takes it at once: a new
+// sound placed and started between two commits would else play its first block from where the voice last was.
+bool Waits(const Voice& v, uint32_t apply) { return apply == kDeferred && v.has_gain && (v.stream || v.playing); }
 // Completed packets' callbacks, run as the XDK runs them: in DirectSoundDoWork on the title's thread, so they never
 // overlap the title's own stream code. A stream flushed or released runs its own at once, before it is gone.
 std::deque<Done> g_done;
@@ -1037,7 +1040,7 @@ BUFFER(PlayEx, 4) {
 // (this, mode, apply)
 BUFFER(SetMode, 3) {
     v.next.mode = a[1];
-    if (a[2] != kDeferred) v.spot.mode = v.next.mode;
+    if (!Waits(v, a[2])) v.spot.mode = v.next.mode;
     return 0;
 }
 BUFFER(Stop, 1) {
@@ -1122,17 +1125,17 @@ BUFFER(SetMixBins, 2) {
 }
 BUFFER(SetMaxDistance, 3) {
     v.next.max_dist = F32(a[1]);
-    if (a[2] != kDeferred) v.spot.max_dist = v.next.max_dist;
+    if (!Waits(v, a[2])) v.spot.max_dist = v.next.max_dist;
     return 0;
 }
 BUFFER(SetMinDistance, 3) {
     v.next.min_dist = F32(a[1]);
-    if (a[2] != kDeferred) v.spot.min_dist = v.next.min_dist;
+    if (!Waits(v, a[2])) v.spot.min_dist = v.next.min_dist;
     return 0;
 }
 BUFFER(SetPosition, 5) {
     for (int i = 0; i < 3; i++) v.next.p[i] = F32(a[1 + i]);
-    if (a[4] != kDeferred) std::copy(v.next.p, v.next.p + 3, v.spot.p);
+    if (!Waits(v, a[4])) std::copy(v.next.p, v.next.p + 3, v.spot.p);
     return 0;
 }
 BUFFER(SetVelocity, 5) { return 0; }
@@ -1143,14 +1146,14 @@ BUFFER(SetAllParameters, 3) {
     v.next.min_dist = F32(R32(a[1] + 0x34));
     v.next.max_dist = F32(R32(a[1] + 0x38));
     v.next.mode = R32(a[1] + 0x3C);
-    if (a[2] != kDeferred) v.spot = v.next;
+    if (!Waits(v, a[2])) v.spot = v.next;
     return 0;
 }
 // (this, points, count, apply)
 BUFFER(SetRolloffCurve, 4) {
     v.next.curve.clear();
     for (uint32_t i = 0; a[1] && i < std::min<uint32_t>(a[2], 64); i++) v.next.curve.push_back(F32(R32(a[1] + i * 4)));
-    if (a[3] != kDeferred) v.spot.curve = v.next.curve;
+    if (!Waits(v, a[3])) v.spot.curve = v.next.curve;
     return 0;
 }
 BUFFER(SetOutputBuffer, 2) { return 0; }  // the voice keeps its own mix bins
@@ -1304,17 +1307,17 @@ STREAM(SetMixBins, 2) {
 }
 STREAM(SetMaxDistance, 3) {
     v.next.max_dist = F32(a[1]);
-    if (a[2] != kDeferred) v.spot.max_dist = v.next.max_dist;
+    if (!Waits(v, a[2])) v.spot.max_dist = v.next.max_dist;
     return 0;
 }
 STREAM(SetMinDistance, 3) {
     v.next.min_dist = F32(a[1]);
-    if (a[2] != kDeferred) v.spot.min_dist = v.next.min_dist;
+    if (!Waits(v, a[2])) v.spot.min_dist = v.next.min_dist;
     return 0;
 }
 STREAM(SetPosition, 5) {
     for (int i = 0; i < 3; i++) v.next.p[i] = F32(a[1 + i]);
-    if (a[4] != kDeferred) std::copy(v.next.p, v.next.p + 3, v.spot.p);
+    if (!Waits(v, a[4])) std::copy(v.next.p, v.next.p + 3, v.spot.p);
     return 0;
 }
 STREAM(SetVelocity, 5) { return 0; }
@@ -1324,19 +1327,19 @@ STREAM(SetAllParameters, 3) {
     v.next.min_dist = F32(R32(a[1] + 0x34));
     v.next.max_dist = F32(R32(a[1] + 0x38));
     v.next.mode = R32(a[1] + 0x3C);
-    if (a[2] != kDeferred) v.spot = v.next;
+    if (!Waits(v, a[2])) v.spot = v.next;
     return 0;
 }
 STREAM(SetMode, 3) {
     v.next.mode = a[1];
-    if (a[2] != kDeferred) v.spot.mode = v.next.mode;
+    if (!Waits(v, a[2])) v.spot.mode = v.next.mode;
     return 0;
 }
 // (this, points, count, apply)
 STREAM(SetRolloffCurve, 4) {
     v.next.curve.clear();
     for (uint32_t i = 0; a[1] && i < std::min<uint32_t>(a[2], 64); i++) v.next.curve.push_back(F32(R32(a[1] + i * 4)));
-    if (a[3] != kDeferred) v.spot.curve = v.next.curve;
+    if (!Waits(v, a[3])) v.spot.curve = v.next.curve;
     return 0;
 }
 STREAM(SetI3DL2Source, 3) { return 0; }
