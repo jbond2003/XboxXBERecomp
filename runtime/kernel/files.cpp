@@ -66,6 +66,15 @@ fs::path MatchCase(const fs::path& dir, const std::vector<std::string>& parts) {
     return cur;
 }
 
+// saves (the title's UDATA folder on E:) and files on the utility drive Z: the title wrote itself, not its caches
+bool Traced(const std::string& host) {
+    std::string up = Upper(host);
+    for (char& c : up)
+        if (c == '/') c = '\\';
+    return up.find("\\E\\UDATA\\") != std::string::npos ||
+           (up.find("\\Z\\") != std::string::npos && up.find("SNDCACHE") == std::string::npos);
+}
+
 struct File : Object {
     fs::path host;
     std::string xbox;
@@ -78,10 +87,15 @@ struct File : Object {
     size_t next = 0;
     bool listed = false;
     bool delete_on_close = false;
+    bool trace = false;    // a save or the title's own state on the hard disk: its use goes to the log
+    uint64_t written = 0;  // bytes written through this handle, for that log
     std::mutex io;  // threads sharing a handle: seek and transfer stay together
     File() : Object(ObjType::File) {}
     ~File() override {
         if (fp) std::fclose(fp);
+        if (trace && (written || delete_on_close))
+            LOGR("files: closed %s, %llu bytes written%s", xbox.c_str(), (unsigned long long)written,
+                 delete_on_close ? ", deleted" : "");
         if (delete_on_close) {
             std::error_code ec;
             fs::remove(host, ec);
@@ -346,6 +360,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
                 return kObjectNameNotFound;
             }
             fs::create_directories(host, ec);
+            if (Traced(host + "\\")) LOGR("files: made folder %s%s", name.c_str(), ec ? " FAILED" : "");
             info = 2;
         } else if (disposition == 2) {
             IoStatus(iosb, kObjectNameCollision, 4);
@@ -359,6 +374,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
         f->host = host;
         f->xbox = Normalize(name);
         f->dir = true;
+        f->trace = Traced(host + "\\");
         W32(handle_out, NewHandle(f));
         IoStatus(iosb, kSuccess, info);
         return kSuccess;
@@ -403,13 +419,14 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     }
     // a file in a missing folder fails as on the console: XAPI probes saves with OPEN_ALWAYS
     if (!exists && !fs::is_directory(fs::path(host).parent_path(), ec)) {
+        if (Traced(host)) LOGR("files: %s has no folder", name.c_str());
         IoStatus(iosb, kObjectPathNotFound, 0);
         return kObjectPathNotFound;
     }
     FILE* fp = std::fopen(host.c_str(), mode);
     if (!fp && std::string(mode) == "r+b") fp = std::fopen(host.c_str(), "rb");  // read only media
     if (!fp) {
-        LOGW("NtCreateFile: cannot open %s", host.c_str());
+        LOGE("NtCreateFile: cannot open %s", host.c_str());
         IoStatus(iosb, kAccessDenied, 0);
         return kAccessDenied;
     }
@@ -418,6 +435,8 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     f->xbox = Normalize(name);
     f->fp = fp;
     f->delete_on_close = options & 0x1000;  // FILE_DELETE_ON_CLOSE
+    f->trace = Traced(host);
+    if (f->trace) LOGR("files: open %s (disposition %u, %s)", name.c_str(), disposition, info == 2 ? "created" : info == 3 ? "overwritten" : "existing");
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, info);
     LOG_FIRST(400, "open %s", name.c_str());
@@ -447,6 +466,8 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
         if (!f->fp) f->fp = std::fopen(host.c_str(), "rb");
         if (!f->fp) return kAccessDenied;
     }
+    f->trace = !f->dir && Traced(host);
+    if (f->trace) LOGR("files: open %s (existing)", name.c_str());
     (void)options;
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, 1);
@@ -490,6 +511,7 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     // the console's disk keeps what a write sent: the title may restart into a new process (a quick reboot) or
     // quit with the handle still open, and both end with _Exit, which drops what stdio still buffers
     if (write && f->fp) std::fflush(f->fp);
+    if (write) f->written += n;
     f->pos = pos + n;
     if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
     if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
@@ -709,6 +731,7 @@ KERNEL_EXPORT(210, NtQueryFullAttributesFile, 2) {
 KERNEL_EXPORT(195, NtDeleteFile, 1) {
     std::string host = ResolvePath(ReadAnsiString(R32(a[0] + 4)), R32(a[0]));
     std::error_code ec;
+    if (Traced(host) || Traced(host + "\\")) LOGR("files: delete %s", ReadAnsiString(R32(a[0] + 4)).c_str());
     if (host.empty() || !fs::remove(host, ec)) return kObjectNameNotFound;
     return kSuccess;
 }

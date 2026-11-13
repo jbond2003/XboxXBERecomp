@@ -1187,7 +1187,7 @@ KERNEL_EXPORT(49, HalReturnToFirmware, 1) {
                 std::fwrite(HostPtr(page), 1, 0x1000, f);
                 std::fclose(f);
             }
-            LOGI("relaunching into %s", path.c_str());
+            LOGR("relaunching into %s, launch type %u", path.c_str(), R32(page));
             Relaunch(exe);
         }
         LOGW("HalReturnToFirmware: %s is no recompiled image", path.c_str());

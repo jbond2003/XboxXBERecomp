@@ -143,8 +143,11 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
         lf.close();
         std::remove(g_launch_file.c_str());
         W32(g_launch_data_page_va, page);
-        LOGI("boot: launch data from the previous run, type %u", R32(page));
+        LOGR("boot: launch data from the previous run, type %u, data %08X %08X", R32(page), R32(page + 0x400),
+             R32(page + 0x404));
         LoadPersistedDisplay();
+    } else {
+        LOGR("boot: no launch data, a fresh start");
     }
     std::remove(PersistFile().c_str());
 
