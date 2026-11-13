@@ -487,6 +487,9 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
         n += uint32_t(done);
         if (done < chunk) break;
     }
+    // the console's disk keeps what a write sent: the title may restart into a new process (a quick reboot) or
+    // quit with the handle still open, and both end with _Exit, which drops what stdio still buffers
+    if (write && f->fp) std::fflush(f->fp);
     f->pos = pos + n;
     if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
     if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
@@ -567,14 +570,32 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
             f->delete_on_close = G<uint8_t>(in) != 0;
             break;
         case 10: {  // rename: ReplaceIfExists, RootDirectory, FileName (ANSI_STRING inline)
+            bool replace = G<uint8_t>(in) != 0;
             uint32_t root = R32(in + 4);
             std::string target = ReadAnsiString(in + 8);
             std::string host = ResolvePath(target, root);
             if (host.empty()) return kObjectPathNotFound;
-            if (f->fp) std::fflush(f->fp);
+            if (!replace && fs::exists(host, ec)) return kObjectNameCollision;
+            // Windows renames no file a FILE* holds open (fopen does not share delete), and the title renames
+            // through the very handle it has open: close it for the rename and open the file again after
+            std::lock_guard<std::mutex> lock(f->io);
+            if (f->fp) {
+                std::fclose(f->fp);
+                f->fp = nullptr;
+            }
             fs::rename(f->host, host, ec);
-            if (ec) return kAccessDenied;
-            f->host = host;
+            if (!ec) f->host = host;
+            if (!f->dir) {
+                f->fp = std::fopen(f->host.string().c_str(), "r+b");
+                if (!f->fp) f->fp = std::fopen(f->host.string().c_str(), "rb");
+            }
+            if (ec) {
+                LOGW("NtSetInformationFile: cannot rename %s to %s: %s", f->xbox.c_str(), target.c_str(),
+                     ec.message().c_str());
+                return kAccessDenied;
+            }
+            auto dir = root ? FileFromHandle(root) : nullptr;
+            f->xbox = Normalize(dir ? dir->xbox + "\\" + target : target);
             break;
         }
         case 4:  // basic, times and attributes are not kept
