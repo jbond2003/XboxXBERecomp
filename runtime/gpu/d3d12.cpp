@@ -122,7 +122,7 @@ bool CaptureOn() {
 // alone (reversed: 0 where it is not, 1 / depth its distance in near planes). A tap's own blur decides whether it
 // reaches a pixel, so the gun spreads over the sharp world behind it and the world never smears into the gun.
 // p0: 1 / width, 1 / height, amount 0 to 1, the widest radius in pixels; p1: the distances of full blur and of none
-const char* kDofHlsl = R"(
+const char* kGunBlurHlsl = R"(
 cbuffer P : register(b1) { float4 p0; float4 p1; };
 Texture2D frame : register(t0);
 Texture2D<float> depth : register(t1);
@@ -140,7 +140,7 @@ float blur(float2 uv) {
     if (d <= 0) return 0;
     return p0.z * saturate((p1.y - 1 / d) / (p1.y - p1.x));
 }
-float4 dof(V i) : SV_Target {
+float4 gun_blur(V i) : SV_Target {
     float4 own = frame.SampleLevel(LinearSampler, i.uv, 0);
     float3 sum = own.rgb;
     float n = 1;
@@ -154,6 +154,38 @@ float4 dof(V i) : SV_Target {
         n += w;
     }
     return float4(sum / n, own.a);
+}
+)";
+
+// Depth of field while aiming: the sight picture in the middle of the frame stays sharp and everything around it,
+// gun and world alike, goes out of focus the further from the middle it is. Run when the gun's scene is complete and
+// the HUD is not yet drawn.
+// p0: 1 / width, 1 / height, amount 0 to 1, the widest radius in pixels; p1: width / height, and the distances from
+// the middle (in half heights) where the blur starts and where it is whole
+const char* kDofHlsl = R"(
+cbuffer P : register(b1) { float4 p0; float4 p1; };
+Texture2D frame : register(t0);
+SamplerState LinearSampler : register(s0);
+struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+V vs(uint id : SV_VertexID) {
+    V o;
+    o.uv = float2((id << 1) & 2, id & 2);
+    o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+float4 dof(V i) : SV_Target {
+    float4 own = frame.SampleLevel(LinearSampler, i.uv, 0);
+    float2 from = (i.uv - 0.5) * float2(2 * p1.x, 2);
+    float blur = p0.z * smoothstep(p1.y, p1.z, length(from));
+    if (blur <= 0.001) return own;
+    float3 sum = own.rgb;
+    const int kTaps = 32;
+    for (int k = 1; k <= kTaps; k++) {
+        float t = sqrt(k / float(kTaps));
+        float a = k * 2.39996323;
+        sum += frame.SampleLevel(LinearSampler, i.uv + float2(cos(a), sin(a)) * t * blur * p0.w * p0.xy, 0).rgb;
+    }
+    return float4(sum / (kTaps + 1), own.a);
 }
 )";
 
@@ -661,6 +693,7 @@ private:
     ID3D12PipelineState* EnsurePassPipeline(const char* hlsl, const char* vs_entry, const char* entry, DXGI_FORMAT rtv,
                                             float blend, uint32_t samples = 1);
     void DepthOfFieldStep(const State& s, uint32_t flags);
+    void GunBlur(const State& s, float amount);
     void DepthOfField(const State& s, float amount);
     // Draw, in call order, each callee right after its caller
     bool DepthCopy(const State& s);
@@ -3275,7 +3308,7 @@ void D3D12Backend::ClearChannels(Target& t, const float col[4], uint8_t mask, co
 }
 
 // A title that draws the world, clears depth alone, draws the gun and clears depth again (g_dof's): the clear that
-// ends the gun's scene is where the gun goes out of focus, its depth still there and the HUD not yet drawn.
+// ends the gun's scene is where the frame goes out of focus, the gun's depth still there and the HUD not yet drawn.
 void D3D12Backend::DepthOfFieldStep(const State& s, uint32_t flags) {
     constexpr uint32_t kWorldDraws = 25;  // fewer is not the world's scene
     if ((flags & kClearTarget) || !(flags & kClearZ) || !s.zs.data) return;
@@ -3287,11 +3320,15 @@ void D3D12Backend::DepthOfFieldStep(const State& s, uint32_t flags) {
     }
     if (dof_stage_ != 1) return;
     dof_stage_ = 2;
-    float amount = std::clamp(g_dof.load(std::memory_order_relaxed), 0.0f, 1.0f);
-    if (draws && amount > 0.01f) DepthOfField(s, amount);
+    if (!draws) return;
+    // the gun by its own depth first, then the frame around the sight picture
+    float gun = std::clamp(g_gun_blur.load(std::memory_order_relaxed), 0.0f, 1.0f);
+    float around = std::clamp(g_dof.load(std::memory_order_relaxed), 0.0f, 1.0f);
+    if (gun > 0.01f) GunBlur(s, gun);
+    if (around > 0.01f) DepthOfField(s, around);
 }
 
-void D3D12Backend::DepthOfField(const State& s, float amount) {
+void D3D12Backend::GunBlur(const State& s, float amount) {
     constexpr float kRadius = 0.011f;            // the widest blur, of the frame's height
     constexpr float kNear = 8.0f, kFar = 30.0f;  // near planes away: all of the blur, and none
     Target* rt = EnsureTarget(s.rt, false);
@@ -3304,6 +3341,23 @@ void D3D12Backend::DepthOfField(const State& s, float amount) {
     ID3D12Resource* const src[3] = {colour, depth, nullptr};
     const DXGI_FORMAT fmt[3] = {rt->fmt, kDepthRead, rt->fmt};
     const float p[8] = {1.0f / float(rt->w), 1.0f / float(rt->h), amount, float(rt->h) * kRadius, kNear, kFar};
+    Pass(kGunBlurHlsl, "vs", "gun_blur", rt->fmt, Cpu(rtv_heap_.Get(), rt->view, rtv_inc_), rt->w, rt->h, src, fmt, p, -1, Ms(*rt));
+    rt->drawn = true;
+}
+
+void D3D12Backend::DepthOfField(const State& s, float amount) {
+    constexpr float kRadius = 0.014f;              // the widest blur, of the frame's height
+    constexpr float kSharp = 0.30f, kWhole = 0.95f;  // half heights from the middle: sharp inside, all of the blur outside
+    Target* rt = EnsureTarget(s.rt, false);
+    if (!rt) return;
+    ID3D12Resource* colour = Feedback(*rt);
+    if (!colour) return;
+    Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12Resource* const src[3] = {colour, nullptr, nullptr};
+    const DXGI_FORMAT fmt[3] = {rt->fmt, rt->fmt, rt->fmt};
+    // the frame is shown as a 16:9 or a 4:3 picture whatever the target's own shape
+    float aspect = app::Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
+    const float p[8] = {1.0f / float(rt->w), 1.0f / float(rt->h), amount, float(rt->h) * kRadius, aspect, kSharp, kWhole};
     Pass(kDofHlsl, "vs", "dof", rt->fmt, Cpu(rtv_heap_.Get(), rt->view, rtv_inc_), rt->w, rt->h, src, fmt, p, -1, Ms(*rt));
     rt->drawn = true;
 }
