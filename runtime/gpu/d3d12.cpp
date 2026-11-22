@@ -317,7 +317,7 @@ float2 occlusion_blur(float4 pos : SV_Position) : SV_Target {
 // the fog is already drawn: only the scene share under it is occluded, blended as colour * a + rgb
 float4 occlusion_apply(float4 pos : SV_Position) : SV_Target {
     float z;
-    float a = Smooth(pos.xy, z);
+    float a = pow(saturate(Smooth(pos.xy, z)), fog.w);  // fog.w: the title's strength
     float fogged = min(saturate(fog.x * z + fog.y), fog.z);
     return float4(fogcolor.rgb * fogged * (1 - a), a);
 }
@@ -3500,7 +3500,7 @@ void D3D12Backend::Occlusion(const State& s, const float p[4 * kOcclusionRects])
     float past = float(1.0 - (double(v.min_z) + double(p[5]) * double(zr)));
     float c[kAoConstants] = {p[0], p[1], p[2], p[3], p[4] * zr, past, 0, 0,
                              float(rect.left), float(rect.top), w, h, p[7], kAoMaxSpan * h, 0, 0,
-                             p[8], p[9], p[10], 0, p[12], p[13], p[14], 0};
+                             p[8], p[9], p[10], p[11] > 0 ? p[11] : 1.0f, p[12], p[13], p[14], 0};
     ID3D12Resource* depth = Feedback(*ds);  // a single sample copy to read
     if (!depth) return;
     AoPass raw{.entry = p[6] ? "gtao" : "occlusion", .rtv = OcclusionView(0), .depth = depth};
