@@ -1530,6 +1530,21 @@ void Walk(uint32_t end) {
     g_walk = end;
 }
 }  // namespace
+
+// sent as p: 1 / the projection's x and y scale, its x and y centre, then view z = p[4] / (depth - p[5]), then
+// p[6]: 1 for GTAO, 0 for SSAO, p[7] the radius, then the fog p[8] to p[10] and its colour p[12] to p[14]
+void Occlusion(const float* m, bool gtao, float radius, const float* fog, const float* fog_colour) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    bool perspective = m[11] == 1.0f && m[15] == 0.0f;
+    if (!g_backend || !perspective || !m[0] || !m[5] || !(radius > 0)) return;
+    Walk(Dev(kDevPush));  // what the title pushed itself is drawn first
+    static const float kNone[3] = {};
+    if (!fog || !fog_colour) fog = fog_colour = kNone;
+    const float p[4 * gpu::kOcclusionRects] = {1 / m[0], 1 / m[5], m[8], m[9], m[14], m[10], gtao ? 1.0f : 0.0f, radius,
+                                               fog[0], fog[1], fog[2], 0,
+                                               fog_colour[0], fog_colour[1], fog_colour[2], 0};
+    g_backend->Clear(g_state, gpu::kOcclusionRects, reinterpret_cast<const uint8_t*>(p), gpu::kClearOcclusion, 0, 0, 0);
+}
 }  // namespace d3d
 
 HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {

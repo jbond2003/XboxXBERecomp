@@ -15,7 +15,11 @@ enum : uint32_t {
     kClearTarget = 0xF0,  // ARGB channels
     kClearZ = 0x01,
     kClearStencil = 0x02,
+    // Not a D3DCLEAR value: ambient occlusion over what the target holds now, in order with the draws. The rects are
+    // kOcclusionRects of floats in place of ints, as d3d::Occlusion (xdk/d3d8.h) fills them
+    kClearOcclusion = 0x100,
 };
+constexpr uint32_t kOcclusionRects = 4;
 
 class Backend {
 public:
