@@ -118,6 +118,45 @@ bool CaptureOn() {
     return !diag::CaptureDir().empty();
 }
 
+// The gun out of focus while aiming: run when the gun's own scene is complete, over a depth buffer that holds the gun
+// alone (reversed: 0 where it is not, 1 / depth its distance in near planes). A tap's own blur decides whether it
+// reaches a pixel, so the gun spreads over the sharp world behind it and the world never smears into the gun.
+// p0: 1 / width, 1 / height, amount 0 to 1, the widest radius in pixels; p1: the distances of full blur and of none
+const char* kDofHlsl = R"(
+cbuffer P : register(b1) { float4 p0; float4 p1; };
+Texture2D frame : register(t0);
+Texture2D<float> depth : register(t1);
+SamplerState LinearSampler : register(s0);
+SamplerState PointSampler : register(s1);
+struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+V vs(uint id : SV_VertexID) {
+    V o;
+    o.uv = float2((id << 1) & 2, id & 2);
+    o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+float blur(float2 uv) {
+    float d = depth.SampleLevel(PointSampler, uv, 0);
+    if (d <= 0) return 0;
+    return p0.z * saturate((p1.y - 1 / d) / (p1.y - p1.x));
+}
+float4 dof(V i) : SV_Target {
+    float4 own = frame.SampleLevel(LinearSampler, i.uv, 0);
+    float3 sum = own.rgb;
+    float n = 1;
+    const int kTaps = 24;
+    for (int k = 1; k <= kTaps; k++) {
+        float t = sqrt(k / float(kTaps));
+        float a = k * 2.39996323;
+        float2 uv = i.uv + float2(cos(a), sin(a)) * t * p0.w * p0.xy;
+        float w = saturate((blur(uv) - t) * 6 + 1);
+        sum += frame.SampleLevel(LinearSampler, uv, 0).rgb * w;
+        n += w;
+    }
+    return float4(sum / n, own.a);
+}
+)";
+
 const char* kSmaaConfig = R"(
 cbuffer P : register(b1) { float4 metrics; };
 #define SMAA_RT_METRICS metrics
@@ -618,9 +657,11 @@ private:
               float blend) override;
     bool Pass(const char* hlsl, const char* vs_entry, const char* entry, DXGI_FORMAT rtv,
               D3D12_CPU_DESCRIPTOR_HANDLE rh, uint32_t w, uint32_t h, ID3D12Resource* const src[3],
-              const DXGI_FORMAT fmt[3], const float p[8], float blend);
+              const DXGI_FORMAT fmt[3], const float p[8], float blend, uint32_t samples = 1);
     ID3D12PipelineState* EnsurePassPipeline(const char* hlsl, const char* vs_entry, const char* entry, DXGI_FORMAT rtv,
-                                            float blend);
+                                            float blend, uint32_t samples = 1);
+    void DepthOfFieldStep(const State& s, uint32_t flags);
+    void DepthOfField(const State& s, float amount);
     // Draw, in call order, each callee right after its caller
     bool DepthCopy(const State& s);
     bool DepthPass(ID3D12Resource* src, uint32_t src_samples, D3D12_CPU_DESCRIPTOR_HANDLE dh, uint32_t w, uint32_t h,
@@ -864,6 +905,10 @@ private:
     };
     std::vector<CapTex> cap_tex_;
     ComPtr<ID3D12Resource> lut_;
+    // depth of field: draws with a depth buffer since the last clear of depth alone, and how far the frame has come
+    // (0 the world not seen yet, 1 the world is done and the gun's scene is next, 2 nothing more this frame)
+    uint32_t dof_draws_ = 0;
+    int dof_stage_ = 0;
     // SMAA: edges, blend weights and the blended frame, at the frame's size; its area and search lookups
     ComPtr<ID3D12Resource> smaa_[kSmaaTargets];
     ComPtr<ID3D12Resource> smaa_lut_[2];
@@ -1679,8 +1724,8 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
 
 // Pass's pipeline for the shader, kept in blit_psos_; null when it can't be made
 ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const char* vs_entry, const char* entry,
-                                                      DXGI_FORMAT rtv, float blend) {
-    uint64_t seed = uint64_t(rtv) << 1 | (blend >= 0 ? 1 : 0);
+                                                      DXGI_FORMAT rtv, float blend, uint32_t samples) {
+    uint64_t seed = uint64_t(rtv) << 1 | (blend >= 0 ? 1 : 0) | uint64_t(samples > 1 ? samples : 0) << 40;
     uint64_t source_seed = Hash(hlsl, std::strlen(hlsl), seed);
     uint64_t entry_seed = Hash(entry, std::strlen(entry), source_seed);
     bool own_vs = std::strcmp(vs_entry, "vs") != 0;  // the usual one keeps the key it always had
@@ -1690,7 +1735,7 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
     ID3DBlob* vs = Compile(hlsl, vs_entry, "vs_5_0", h);
     ID3DBlob* ps = Compile(hlsl, entry, "ps_5_0", h);
     if (!vs || !ps) return nullptr;
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv, samples);
     if (blend >= 0) {
         auto& b = d.BlendState.RenderTarget[0];
         b.BlendEnable = TRUE;
@@ -1710,8 +1755,8 @@ void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3
 
 bool D3D12Backend::Pass(const char* hlsl, const char* vs_entry, const char* entry, DXGI_FORMAT rtv,
                         D3D12_CPU_DESCRIPTOR_HANDLE rh, uint32_t w, uint32_t h, ID3D12Resource* const src[3],
-                        const DXGI_FORMAT fmt[3], const float p[8], float blend) {
-    ID3D12PipelineState* pso = EnsurePassPipeline(hlsl, vs_entry, entry, rtv, blend);
+                        const DXGI_FORMAT fmt[3], const float p[8], float blend, uint32_t samples) {
+    ID3D12PipelineState* pso = EnsurePassPipeline(hlsl, vs_entry, entry, rtv, blend, samples);
     if (!pso) return false;
     uint32_t slot = AllocSrvSlots(4);
     for (int i = 0; i < 4; i++) {
@@ -3089,6 +3134,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         return;
     }
     PerfScope perf_draw{g_perf.draw};
+    if (s.zs.data) dof_draws_++;
     g_perf.draws++;
     if (cap_) CapStep(s.rt);
     if (DepthCopy(s)) return;
@@ -3228,6 +3274,40 @@ void D3D12Backend::ClearChannels(Target& t, const float col[4], uint8_t mask, co
     }
 }
 
+// A title that draws the world, clears depth alone, draws the gun and clears depth again (g_dof's): the clear that
+// ends the gun's scene is where the gun goes out of focus, its depth still there and the HUD not yet drawn.
+void D3D12Backend::DepthOfFieldStep(const State& s, uint32_t flags) {
+    constexpr uint32_t kWorldDraws = 25;  // fewer is not the world's scene
+    if ((flags & kClearTarget) || !(flags & kClearZ) || !s.zs.data) return;
+    uint32_t draws = dof_draws_;
+    dof_draws_ = 0;
+    if (dof_stage_ == 0) {
+        if (draws >= kWorldDraws) dof_stage_ = 1;
+        return;
+    }
+    if (dof_stage_ != 1) return;
+    dof_stage_ = 2;
+    float amount = std::clamp(g_dof.load(std::memory_order_relaxed), 0.0f, 1.0f);
+    if (draws && amount > 0.01f) DepthOfField(s, amount);
+}
+
+void D3D12Backend::DepthOfField(const State& s, float amount) {
+    constexpr float kRadius = 0.011f;            // the widest blur, of the frame's height
+    constexpr float kNear = 8.0f, kFar = 30.0f;  // near planes away: all of the blur, and none
+    Target* rt = EnsureTarget(s.rt, false);
+    Target* ds = EnsureTarget(s.zs, true);
+    if (!rt || !ds || rt->w != ds->w || rt->h != ds->h) return;
+    ID3D12Resource* colour = Feedback(*rt);
+    ID3D12Resource* depth = Feedback(*ds);
+    if (!colour || !depth) return;
+    Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12Resource* const src[3] = {colour, depth, nullptr};
+    const DXGI_FORMAT fmt[3] = {rt->fmt, kDepthRead, rt->fmt};
+    const float p[8] = {1.0f / float(rt->w), 1.0f / float(rt->h), amount, float(rt->h) * kRadius, kNear, kFar};
+    Pass(kDofHlsl, "vs", "dof", rt->fmt, Cpu(rtv_heap_.Get(), rt->view, rtv_inc_), rt->w, rt->h, src, fmt, p, -1, Ms(*rt));
+    rt->drawn = true;
+}
+
 void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                          uint32_t stencil) {
     drew_ = true;
@@ -3237,6 +3317,7 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
         fprintf(cap_, "%04u clear rt %08X ds %08X flags %X color %08X z %.3f\n", cap_i_++, s.rt.data, s.zs.data, flags,
                 color, z);
     }
+    DepthOfFieldStep(s, flags);
     Target* rt = (flags & kClearTarget) ? EnsureTarget(s.rt, false) : nullptr;
     Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true) : nullptr;
     uint32_t gw;
@@ -3805,6 +3886,8 @@ void D3D12Backend::Present(const Surface& front) {
         shown_ = t ? t->data : 0;
     }
     drew_ = false;
+    dof_draws_ = 0;
+    dof_stage_ = 0;
     if (ramp_dirty_) UploadGammaRamp();
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 

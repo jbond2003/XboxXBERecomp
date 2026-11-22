@@ -70,6 +70,10 @@ inline std::atomic<uint64_t> g_perf_capture_ns{0}, g_perf_wait_ns{0}, g_perf_wai
 inline std::atomic<uint64_t> g_perf_wait_kind_ns[6];  // read-back, resource, fence, flush, copy, next frame
 inline std::atomic<uint64_t> g_perf_sync_late{0}, g_perf_sync_block{0};  // read-backs the title waited for, by cause
 
+// Depth of field on the gun: 0 none, up to 1 for all of it; a title sets it each frame from how far the player aims
+// down the sights. Only for a title that draws the gun in a scene of its own after a clear of depth alone.
+inline std::atomic<float> g_dof{0.0f};
+
 // F3: save the next frame, every draw and target, under diag::CaptureDir
 inline std::atomic<bool> g_capture{false};
 
