@@ -219,6 +219,23 @@ float3 Normal(float2 pos, float3 c) {
     float3 dy = abs(d.z - c.z) < abs(c.z - u.z) ? d - c : c - u;
     return normalize(cross(dx, dy));
 }
+// 1 on a thing a few pixels thin that stands in front of what is behind it on both sides: a blade of grass, a wire.
+// Its normal from the depth is noise and everything about it reads as an occluder, so it is left unshaded.
+float Thin(float2 pos, float3 c) {
+    float m = 0;
+    for (int i = 1; i <= 2; i++) {
+        float x = min(View(pos - float2(i, 0)).z, View(pos + float2(i, 0)).z) - c.z;
+        float y = min(View(pos - float2(0, i)).z, View(pos + float2(0, i)).z) - c.z;
+        m = max(m, max(x, y));
+    }
+    return saturate(m / (c.z * 0.01) - 1);
+}
+// A sample's reach: one nearer the eye than the pixel counts as twice as far, so a thin thing in front (grass, a
+// post) throws less shade on what is behind it.
+float3 Reach(float3 d) { return float3(d.xy, d.z < 0 ? d.z * 2 : d.z); }
+// 0 for a sample that rises less than 8% of the radius above the pixel's surface, 1 from twice that: a decal laid
+// just over the ground (a shell crater) is a step that small, and shaded the ground along its whole edge.
+float Rise(float h) { return saturate(h / (opt.x * 0.08) - 1); }
 static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
 // opt: world radius, most pixels it may span; out: occlusion, view z
 float2 occlusion(float4 pos : SV_Position) : SV_Target {
@@ -236,11 +253,12 @@ float2 occlusion(float4 pos : SV_Position) : SV_Target {
         float f = (i + 0.5) / 16;
         float t = i * 2.3999632 + turn;
         float3 v = (View(pos.xy + float2(cos(t), sin(t)) * rad * (k * f)) - c) / R;
-        float vv = dot(v, v);
+        float3 rv = Reach(v);
+        float vv = dot(rv, rv);
         float w = max(1 - vv, 0);
-        a += w * w * w * max((dot(v, n) - 0.05) / (vv + 0.01), 0);
+        a += w * w * w * max((dot(v, n) - 0.05) / (vv + 0.01), 0) * Rise(dot(v, n) * R);
     }
-    return float2(max(1 - a * 0.25, 0), c.z);
+    return float2(lerp(max(1 - a * 0.25, 0), 1, Thin(pos.xy, c)), c.z);
 }
 static const float kHalfPi = 1.5707963;
 // GTAO (Jimenez 2016) at XeGTAO's high preset: 3 slices, 3 steps a side, squared step spread, falloff over the outer
@@ -280,7 +298,8 @@ float2 gtao(float4 pos : SV_Position) : SV_Target {
             float3 d0 = View(pos.xy + off) - c;
             float3 d1 = View(pos.xy - off) - c;
             float2 len = max(float2(length(d0), length(d1)), 1e-4);
-            float2 w = saturate((R - len) / (R * 0.615));
+            float2 reach = float2(length(Reach(d0)), length(Reach(d1)));
+            float2 w = saturate((R - reach) / (R * 0.615)) * float2(Rise(dot(d0, n)), Rise(dot(d1, n)));
             float2 sc = float2(dot(d0, v), dot(d1, v)) / len;
             hc = max(hc, lerp(low, sc, w));
         }
@@ -291,7 +310,7 @@ float2 gtao(float4 pos : SV_Position) : SV_Target {
         float arc1 = (cos_n + 2 * h1 * sin_n - cos(2 * h1 - an)) / 4;
         vis += pn_len * (arc0 + arc1);
     }
-    return float2(pow(saturate(vis / 3), 2.2), c.z);
+    return float2(lerp(pow(saturate(vis / 3), 2.2), 1, Thin(pos.xy, c)), c.z);
 }
 // opt.zw: step; 5 taps average the 4 pixel dither, depth edges left out
 float Smooth(float2 pos, out float z) {
