@@ -228,14 +228,14 @@ float Thin(float2 pos, float3 c) {
         float y = min(View(pos - float2(0, i)).z, View(pos + float2(0, i)).z) - c.z;
         m = max(m, max(x, y));
     }
-    return saturate(m / (c.z * 0.01) - 1);
+    return saturate(m / max(c.z * 0.01, 1e-4) - 1);
 }
 // A sample's reach: one nearer the eye than the pixel counts as twice as far, so a thin thing in front (grass, a
 // post) throws less shade on what is behind it.
 float3 Reach(float3 d) { return float3(d.xy, d.z < 0 ? d.z * 2 : d.z); }
 // 0 for a sample that rises less than 8% of the radius above the pixel's surface, 1 from twice that: a decal laid
 // just over the ground (a shell crater) is a step that small, and shaded the ground along its whole edge.
-float Rise(float h) { return saturate(h / (opt.x * 0.08) - 1); }
+float Rise(float h) { return saturate(h / max(opt.x * 0.08, 1e-4) - 1); }
 static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
 // opt: world radius, most pixels it may span; out: occlusion, view z
 float2 occlusion(float4 pos : SV_Position) : SV_Target {
