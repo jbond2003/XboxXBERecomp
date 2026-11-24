@@ -3997,10 +3997,11 @@ ID3D12Resource* D3D12Backend::PrepareShownFrame(Target* t) {
 // src in the pixel shader resource state: SMAA's blend of it, null when it can't run
 ID3D12Resource* D3D12Backend::Smaa(ID3D12Resource* src, DXGI_FORMAT fmt, uint32_t w, uint32_t h) {
     static const std::string hlsl = std::string(kSmaaConfig) + kSmaaHlsl + kSmaaPasses;
-    if (!EnsureSmaaLookups()) return nullptr;
-    if (!EnsureSmaaTargets(fmt, w, h)) return nullptr;
-    if (!DrawSmaaPasses(src, fmt, w, h, hlsl.c_str())) return nullptr;
-    return smaa_[2].Get();
+    if (EnsureSmaaLookups() && EnsureSmaaTargets(fmt, w, h) && DrawSmaaPasses(src, fmt, w, h, hlsl.c_str())) {
+        return smaa_[2].Get();
+    }
+    LOG_FIRST(1, "d3d12: SMAA is on but could not run: the frame is shown without it");
+    return nullptr;
 }
 
 bool D3D12Backend::EnsureSmaaLookups() {
@@ -4058,7 +4059,7 @@ bool D3D12Backend::EnsureSmaaTargets(DXGI_FORMAT fmt, uint32_t w, uint32_t h) {
     smaa_w_ = w;
     smaa_h_ = h;
     smaa_fmt_ = fmt;
-    LOGI("d3d12: SMAA %ux%u", w, h);
+    LOGR("d3d12: SMAA on, %ux%u", w, h);
     return true;
 }
 
