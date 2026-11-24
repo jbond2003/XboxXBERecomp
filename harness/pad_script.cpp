@@ -3,6 +3,7 @@
 // UP DOWN LEFT RIGHT START BACK A B X Y BLACK WHITE LT RT L3 R3 (stick clicks) LS LSD LSL LSR (left stick up, down,
 // left, right)
 // cmd in the run folder: "buttons [frames held]" pressed once from the frame it is read, then removed
+#include <cstdlib>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -95,6 +96,12 @@ Pad Poll(int port) {
 
 void Rumble(int port, uint16_t left, uint16_t right) {
     if (app::kGame.rumble) app::kGame.rumble(port, left, right);
+}
+
+// the script's pad is an Xbox one unless PAD_PLAYSTATION is set
+bool PlayStationPadInUse() {
+    static const bool playstation = std::getenv("PAD_PLAYSTATION") != nullptr;
+    return playstation;
 }
 
 }  // namespace input

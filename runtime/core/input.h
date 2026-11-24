@@ -16,5 +16,8 @@ uint16_t HeldOnAnyController();  // face buttons as XINPUT_GAMEPAD_A/B/X/Y masks
 // the controller on that port, then GameInfo::pad
 Pad Poll(int port);
 void Rumble(int port, uint16_t left, uint16_t right);
+// the controller last pressed or moved (before any, the first plugged in) is a PlayStation pad (PS3, PS4, PS5), for a
+// game's button prompts
+bool PlayStationPadInUse();
 
 }  // namespace input

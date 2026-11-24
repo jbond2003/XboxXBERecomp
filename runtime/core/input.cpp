@@ -2,6 +2,8 @@
 #include "core/input.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <iterator>
 #include <mutex>
 #include <utility>
@@ -19,6 +21,17 @@ namespace {
 std::mutex g_lock;
 bool g_sdl = false;
 SDL_Gamepad* g_pads[4] = {};
+// the kind of the controller last used: -1 none yet, 0 not a PlayStation pad, 1 a PlayStation pad
+std::atomic<int> g_playstation{-1};
+
+bool IsPlayStation(SDL_Gamepad* pad) {
+    switch (SDL_GetGamepadType(pad)) {
+    case SDL_GAMEPAD_TYPE_PS3:
+    case SDL_GAMEPAD_TYPE_PS4:
+    case SDL_GAMEPAD_TYPE_PS5: return true;
+    default: return false;
+    }
+}
 
 void AddPad(SDL_JoystickID id) {
     for (SDL_Gamepad* pad : g_pads)
@@ -28,6 +41,7 @@ void AddPad(SDL_JoystickID id) {
     *slot = SDL_OpenGamepad(id);
     const char* name = *slot ? SDL_GetGamepadName(*slot) : SDL_GetError();
     LOGI("input: controller %d %s: %s", int(slot - g_pads) + 1, *slot ? "plugged in" : "failed to open", name ? name : "");
+    if (*slot && g_playstation.load() < 0) g_playstation = IsPlayStation(*slot) ? 1 : 0;
 }
 
 void RemovePad(SDL_JoystickID id) {
@@ -107,6 +121,12 @@ Pad Poll(int port) {
             p.ly = int16_t(-1 - axis(SDL_GAMEPAD_AXIS_LEFTY));
             p.rx = int16_t(axis(SDL_GAMEPAD_AXIS_RIGHTX));
             p.ry = int16_t(-1 - axis(SDL_GAMEPAD_AXIS_RIGHTY));
+            // in use: a button, a trigger or a stick well off centre
+            constexpr int kMoved = 12000;
+            bool used = p.buttons || std::any_of(std::begin(p.analog), std::end(p.analog), [](uint8_t a) { return a > 0x40; }) ||
+                        std::abs(int(p.lx)) > kMoved || std::abs(int(p.ly)) > kMoved || std::abs(int(p.rx)) > kMoved ||
+                        std::abs(int(p.ry)) > kMoved;
+            if (used) g_playstation = IsPlayStation(pad) ? 1 : 0;
         }
     }
     if (app::kGame.pad) app::kGame.pad(port, p);
@@ -125,6 +145,8 @@ uint16_t HeldOnAnyController() {
             if (pad && SDL_GetGamepadButton(pad, button)) held |= mask;
     return held;
 }
+
+bool PlayStationPadInUse() { return g_playstation.load() == 1; }
 
 // the motors run until set again
 void Rumble(int port, uint16_t left, uint16_t right) {
