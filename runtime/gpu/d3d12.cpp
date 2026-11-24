@@ -235,7 +235,9 @@ float Thin(float2 pos, float3 c) {
 float3 Reach(float3 d) { return float3(d.xy, d.z < 0 ? d.z * 2 : d.z); }
 // 0 for a sample that rises less than 8% of the radius above the pixel's surface, 1 from twice that: a decal laid
 // just over the ground (a shell crater) is a step that small, and shaded the ground along its whole edge.
-float Rise(float h) { return saturate(h / max(opt.x * 0.08, 1e-4) - 1); }
+// R is the radius in use: near the eye it is cut to what the pass may span, and a step measured by the whole
+// radius was then more than any sample could rise, so nothing near was shaded (lying prone, all the ground in view).
+float Rise(float h, float R) { return saturate(h / max(sqrt(opt.x * R) * 0.08, 1e-4) - 1); }
 static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
 // opt: world radius, most pixels it may span; out: occlusion, view z
 float2 occlusion(float4 pos : SV_Position) : SV_Target {
@@ -256,7 +258,7 @@ float2 occlusion(float4 pos : SV_Position) : SV_Target {
         float3 rv = Reach(v);
         float vv = dot(rv, rv);
         float w = max(1 - vv, 0);
-        a += w * w * w * max((dot(v, n) - 0.05) / (vv + 0.01), 0) * Rise(dot(v, n) * R);
+        a += w * w * w * max((dot(v, n) - 0.05) / (vv + 0.01), 0) * Rise(dot(v, n) * R, R);
     }
     return float2(lerp(max(1 - a * 0.25, 0), 1, Thin(pos.xy, c)), c.z);
 }
@@ -299,7 +301,7 @@ float2 gtao(float4 pos : SV_Position) : SV_Target {
             float3 d1 = View(pos.xy - off) - c;
             float2 len = max(float2(length(d0), length(d1)), 1e-4);
             float2 reach = float2(length(Reach(d0)), length(Reach(d1)));
-            float2 w = saturate((R - reach) / (R * 0.615)) * float2(Rise(dot(d0, n)), Rise(dot(d1, n)));
+            float2 w = saturate((R - reach) / (R * 0.615)) * float2(Rise(dot(d0, n), R), Rise(dot(d1, n), R));
             float2 sc = float2(dot(d0, v), dot(d1, v)) / len;
             hc = max(hc, lerp(low, sc, w));
         }
