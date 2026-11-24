@@ -4000,7 +4000,9 @@ ID3D12Resource* D3D12Backend::Smaa(ID3D12Resource* src, DXGI_FORMAT fmt, uint32_
     if (EnsureSmaaLookups() && EnsureSmaaTargets(fmt, w, h) && DrawSmaaPasses(src, fmt, w, h, hlsl.c_str())) {
         return smaa_[2].Get();
     }
-    LOG_FIRST(1, "d3d12: SMAA is on but could not run: the frame is shown without it");
+    static bool told = false;  // report level: a release log drops LOG_FIRST's lines
+    if (!told) LOGR("d3d12: SMAA is on but could not run: the frame is shown without it");
+    told = true;
     return nullptr;
 }
 
