@@ -3988,7 +3988,7 @@ ID3D12Resource* D3D12Backend::PrepareShownFrame(Target* t) {
     ID3D12Resource* r = Flat(*t, st);
     if (!r) return nullptr;
     Transition(r, *st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    if (app::Get().smaa) {
+    if (app::Get().smaa && !g_smaa_off.load(std::memory_order_relaxed)) {
         if (ID3D12Resource* aa = Smaa(r, t->fmt, t->w, t->h)) r = aa;
     }
     return r;
