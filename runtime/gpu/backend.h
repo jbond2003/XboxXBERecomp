@@ -79,6 +79,8 @@ inline std::atomic<uint64_t> g_perf_sync_late{0}, g_perf_sync_block{0};  // read
 inline std::atomic<float> g_dof{0.0f};
 // The same for the gun alone: the part of it nearest the eye out of focus, by its own depth.
 inline std::atomic<float> g_gun_blur{0.0f};
+// with g_gun_blur: where the blur ends for the gun in hand, in near planes of the gun's scene (0: the usual 30)
+inline std::atomic<float> g_gun_reach{0.0f};
 // A title holds SMAA off while this is set: its menus' text, drawn sharp, is softened by it
 inline std::atomic<bool> g_smaa_off{false};
 // A square render target of this console size (0: none) is made this many times larger still than the render scale

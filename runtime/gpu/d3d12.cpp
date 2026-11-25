@@ -135,33 +135,21 @@ V vs(uint id : SV_VertexID) {
     o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return o;
 }
-// where the blur ends: the gun's furthest point just under the middle of the frame, its front sight, and no further
-// than p1.y. A short gun's front sight is nearer than a long one's, and one distance for all blurred the whole of it
-float sharp() {
-    float reach = 0;
-    for (int k = 0; k < 16; k++) {
-        float d = depth.SampleLevel(PointSampler, float2(0.5, 0.5 + k * 0.008), 0);
-        if (d > 0) reach = max(reach, 1 / d);
-    }
-    return reach > 0 ? min(reach * 0.85, p1.y) : p1.y;
-}
-float blur(float2 uv, float reach) {
+float blur(float2 uv) {
     float d = depth.SampleLevel(PointSampler, uv, 0);
     if (d <= 0) return 0;
-    float close = p1.x * reach / p1.y;
-    return p0.z * saturate((reach - 1 / d) / (reach - close));
+    return p0.z * saturate((p1.y - 1 / d) / (p1.y - p1.x));
 }
 float4 gun_blur(V i) : SV_Target {
     float4 own = frame.SampleLevel(LinearSampler, i.uv, 0);
     float3 sum = own.rgb;
     float n = 1;
-    float reach = sharp();
     const int kTaps = 24;
     for (int k = 1; k <= kTaps; k++) {
         float t = sqrt(k / float(kTaps));
         float a = k * 2.39996323;
         float2 uv = i.uv + float2(cos(a), sin(a)) * t * p0.w * p0.xy;
-        float w = saturate((blur(uv, reach) - t) * 6 + 1);
+        float w = saturate((blur(uv) - t) * 6 + 1);
         sum += frame.SampleLevel(LinearSampler, uv, 0).rgb * w;
         n += w;
     }
@@ -3665,6 +3653,11 @@ void D3D12Backend::DepthOfFieldStep(const State& s, uint32_t flags) {
 void D3D12Backend::GunBlur(const State& s, float amount) {
     constexpr float kRadius = 0.011f;            // the widest blur, of the frame's height
     constexpr float kNear = 8.0f, kFar = 30.0f;  // near planes away: all of the blur, and none
+    // a title's own end for the gun in hand (g_gun_reach), the start kept in proportion: one steady distance for a
+    // gun, where reading the end off the picture made the blur jump as the gun kicked
+    float end = g_gun_reach.load(std::memory_order_relaxed);
+    end = end > 0 && std::isfinite(end) ? std::clamp(end, 2.0f, 400.0f) : kFar;
+    float start = kNear * end / kFar;
     Target* rt = EnsureTarget(s.rt, false);
     Target* ds = EnsureTarget(s.zs, true);
     if (!rt || !ds || rt->w != ds->w || rt->h != ds->h) return;
@@ -3674,7 +3667,7 @@ void D3D12Backend::GunBlur(const State& s, float amount) {
     Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     ID3D12Resource* const src[3] = {colour, depth, nullptr};
     const DXGI_FORMAT fmt[3] = {rt->fmt, kDepthRead, rt->fmt};
-    const float p[8] = {1.0f / float(rt->w), 1.0f / float(rt->h), amount, float(rt->h) * kRadius, kNear, kFar};
+    const float p[8] = {1.0f / float(rt->w), 1.0f / float(rt->h), amount, float(rt->h) * kRadius, start, end};
     Pass(kGunBlurHlsl, "vs", "gun_blur", rt->fmt, Cpu(rtv_heap_.Get(), rt->view, rtv_inc_), rt->w, rt->h, src, fmt, p, -1, Ms(*rt));
     rt->drawn = true;
 }
