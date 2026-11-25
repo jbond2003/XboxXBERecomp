@@ -36,6 +36,7 @@ struct Target {
     DXGI_FORMAT fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
     float range = 1;         // colour held divided by it until the extension resolves the target
     uint64_t tag = ~0ull;    // the extension's
+    bool boosted = false;    // made larger than the render scale makes it (g_boost)
 };
 
 // what the renderer lends an extension, on the render thread

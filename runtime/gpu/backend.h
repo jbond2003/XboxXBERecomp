@@ -81,6 +81,10 @@ inline std::atomic<float> g_dof{0.0f};
 inline std::atomic<float> g_gun_blur{0.0f};
 // A title holds SMAA off while this is set: its menus' text, drawn sharp, is softened by it
 inline std::atomic<bool> g_smaa_off{false};
+// A square render target of this console size (0: none) is made this many times larger still than the render scale
+// makes it, up to 4096 host pixels: a title's shadow picture laid over more of the world than it was made for
+inline std::atomic<uint32_t> g_boost_size{0};
+inline std::atomic<float> g_boost{1.0f};
 
 // F3: save the next frame, every draw and target, under diag::CaptureDir
 inline std::atomic<bool> g_capture{false};

@@ -726,6 +726,7 @@ struct DrawTextures {
     D3D12_SHADER_RESOURCE_VIEW_DESC sv[4];
     ID3D12Resource* res[4];
     bool rt[4] = {};            // stage samples a render target
+    bool smooth[4] = {};        // a target made larger (g_boost): read between its texels whatever the title's filter
     float k[4] = {1, 1, 1, 1};  // Extension::Sample's k
     float wide[4] = {};         // host texels per console texel of a target read into a smaller one, 0 otherwise
 };
@@ -1161,6 +1162,7 @@ private:
     float scale_ = 1.0f;
     uint32_t msaa_ = 1;      // samples in use
     uint32_t msaa_set_ = 0;  // the setting they came from
+    float boost_set_ = 1;    // g_boost as the targets were made with it
     // surfaces locked without a wait: copies in flight, the newest finished one goes to guest memory
     struct Late {
         ComPtr<ID3D12Resource> rb[kFrames];
@@ -1483,6 +1485,16 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
     // (the title's small maps and copies stay as they are)
     bool scene = t.gw == guest_w_ && t.gh == guest_h_;
     if (ext_) ext_->MakeTarget(s, t.depth, t.gw, t.gh, sc, t.fmt);
+    float boost = boost_set_;
+    if (boost > 1 && t.gw == t.gh && t.gw == g_boost_size.load(std::memory_order_relaxed)) {
+        constexpr float kMost = 4096.0f;
+        float boosted = std::min(sc * boost, kMost / float(t.gw));
+        if (boosted > sc) {
+            sc = boosted;
+            t.boosted = true;
+            if (!t.depth) LOGR("d3d12: the %ux%u target is made %.0f pixels wide", t.gw, t.gh, t.gw * sc);
+        }
+    }
     t.w = std::max(1u, uint32_t(std::lround(t.gw * sc)));
     t.h = std::max(1u, uint32_t(std::lround(t.gh * sc)));
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
@@ -2218,6 +2230,7 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
     if (&t == draw_ds_) return nullptr;
     bool feedback = &t == draw_rt_;
     stages.rt[stage] = true;
+    stages.smooth[stage] = t.boosted;
     info.flags |= kTexTarget;
     if (!t.depth && LatchCpuWrite(t)) {
         Surface su;
@@ -2492,6 +2505,7 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     info = {};
     sv = {};
     stages.rt[stage] = false;
+    stages.smooth[stage] = false;
     stages.k[stage] = 1;
     stages.wide[stage] = 0;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -2532,6 +2546,7 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
     D3D12_FILTER_TYPE fmin = lin(min) ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
     D3D12_FILTER_TYPE fmag = lin(mag) ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
     D3D12_FILTER_TYPE fmip = mip == kTexfLinear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+    if (stages.smooth[i]) fmin = fmag = D3D12_FILTER_TYPE_LINEAR;
     sd.Filter = D3D12_FILTER(fmin << 4 | fmag << 2 | fmip);
     bool anisotropic = min == kTexfAnisotropic || mag == kTexfAnisotropic;
     uint32_t an = anisotropic ? std::max<uint32_t>(t[kTssMaxAnisotropy], 1) : 1;
@@ -4319,6 +4334,11 @@ void D3D12Backend::ApplySettings() {
     }
     bool remake = ext_ && ext_->Settings();
     uint32_t msaa = app::Get().msaa;
+    float boost = g_boost.load(std::memory_order_relaxed);
+    if (boost != boost_set_) {
+        boost_set_ = boost;
+        remake = true;
+    }
     if (std::fabs(want - scale_) > 1e-4f || remake || msaa != msaa_set_) {
         Flush();
         for (auto& [key, tg] : targets_) (tg.depth ? free_dsv_ : free_rtv_).push_back(tg.view);
