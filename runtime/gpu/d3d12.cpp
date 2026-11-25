@@ -135,21 +135,33 @@ V vs(uint id : SV_VertexID) {
     o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return o;
 }
-float blur(float2 uv) {
+// where the blur ends: the gun's furthest point just under the middle of the frame, its front sight, and no further
+// than p1.y. A short gun's front sight is nearer than a long one's, and one distance for all blurred the whole of it
+float sharp() {
+    float reach = 0;
+    for (int k = 0; k < 16; k++) {
+        float d = depth.SampleLevel(PointSampler, float2(0.5, 0.5 + k * 0.008), 0);
+        if (d > 0) reach = max(reach, 1 / d);
+    }
+    return reach > 0 ? min(reach * 0.85, p1.y) : p1.y;
+}
+float blur(float2 uv, float reach) {
     float d = depth.SampleLevel(PointSampler, uv, 0);
     if (d <= 0) return 0;
-    return p0.z * saturate((p1.y - 1 / d) / (p1.y - p1.x));
+    float close = p1.x * reach / p1.y;
+    return p0.z * saturate((reach - 1 / d) / (reach - close));
 }
 float4 gun_blur(V i) : SV_Target {
     float4 own = frame.SampleLevel(LinearSampler, i.uv, 0);
     float3 sum = own.rgb;
     float n = 1;
+    float reach = sharp();
     const int kTaps = 24;
     for (int k = 1; k <= kTaps; k++) {
         float t = sqrt(k / float(kTaps));
         float a = k * 2.39996323;
         float2 uv = i.uv + float2(cos(a), sin(a)) * t * p0.w * p0.xy;
-        float w = saturate((blur(uv) - t) * 6 + 1);
+        float w = saturate((blur(uv, reach) - t) * 6 + 1);
         sum += frame.SampleLevel(LinearSampler, uv, 0).rgb * w;
         n += w;
     }
