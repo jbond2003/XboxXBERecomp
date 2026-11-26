@@ -407,6 +407,7 @@ std::string TexFetch(const PixelKey& k, int i) {
     };
     auto tex2d = [&](const std::string& uv) {
         if (t.flags & kTexWide) return F("spreadtap(tex%d, smp%d, %s, spread[%d], %s)", i, i, uv.c_str(), i, Hooks().ReadScale(t).c_str());
+        if (t.flags & kTexCrisp) return F("crisp(tex%d.Sample(smp%d, %s))", i, i, uv.c_str());
         return F("tex%d.Sample(smp%d, %s)", i, i, uv.c_str());
     };
     auto cube = [&](const std::string& dir) {
@@ -472,7 +473,16 @@ const char* kPsSbyte = R"(
 // unorm to byte b, less lo under 128 or hi from 128, over d
 float3 sbyte(float3 u, float lo, float hi, float d) { float3 b = u * 255; return (b - (b >= 128 ? hi : lo)) / d; }
 )";
-const char* kPsTail = R"(float4 spreadtap(Texture2D t, SamplerState s, float2 uv, float4 w, float m) {
+const char* kPsTail = R"(// A silhouette drawn into a large target and laid on the world from far closer than it was drawn (a shadow picture):
+// read between its texels the edge is a slope a texel wide, a blur many pixels across on the ground at the player's
+// feet. The slope is made steep about its middle: a fifth of a texel, never less than a pixel, so far from the eye,
+// where a texel is under a pixel, the alpha is as it was read.
+float4 crisp(float4 t) {
+    float w = max(fwidth(t.a), 0.2);
+    t.a = saturate((t.a - 0.5) / w + 0.5);
+    return t;
+}
+float4 spreadtap(Texture2D t, SamplerState s, float2 uv, float4 w, float m) {
     float4 c = 0;
     int n = (int)w.z;
     for (int y = 0; y < n; y++)

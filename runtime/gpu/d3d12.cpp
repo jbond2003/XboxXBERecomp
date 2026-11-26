@@ -1475,7 +1475,7 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
     if (ext_) ext_->MakeTarget(s, t.depth, t.gw, t.gh, sc, t.fmt);
     float boost = boost_set_;
     if (boost > 1 && t.gw == t.gh && t.gw == g_boost_size.load(std::memory_order_relaxed)) {
-        constexpr float kMost = 4096.0f;
+        constexpr float kMost = 8192.0f;
         float boosted = std::min(sc * boost, kMost / float(t.gw));
         if (boosted > sc) {
             sc = boosted;
@@ -2220,6 +2220,7 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
     stages.rt[stage] = true;
     stages.smooth[stage] = t.boosted;
     info.flags |= kTexTarget;
+    if (t.boosted && !t.depth) info.flags |= kTexCrisp;
     if (!t.depth && LatchCpuWrite(t)) {
         Surface su;
         su.header = s.textures[size_t(stage)];
