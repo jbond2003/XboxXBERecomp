@@ -118,7 +118,7 @@ struct DrawConstants {
     float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
     float zparams[4];    // ReversedDepthHlsl: a w buffer's scale (0 for a z buffer), its far w, the polygon offset
     float sun[5][4];     // kTexSun, d3d::SunShadows: from; gain, shade, bias, slope; across; up; fade
-    float mirror[14][4];  // MirrorHlsl, d3d::Reflections: as its comment lists them
+    float mirror[26][4];  // MirrorHlsl, d3d::Reflections: as its comment lists them
 };
 
 }  // namespace gpu

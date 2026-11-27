@@ -69,12 +69,17 @@ void SunOcclusion(const float view_to_sun[12], float keep, float bias);
 // renderer's: waves that move, its own colour darker where it is looked down into, the mirror, the sky's colour where
 // the picture has nothing to mirror, and the sun's glint. Far off (from 5000 units, all of it at 14000) and in the
 // fog the title's surface is left to show. A frame without the last one's picture is drawn with the sky's colour.
+constexpr int kWaterSplashes = 12;
 struct Water {
     float tone[3];   // the water's own colour: what the title's picture of it averages
     float rough;     // how rough: 1 a sea, less for stiller water (above 0)
     float sky[3];    // the sky's colour
     float glint;     // how bright the sun glints in it, 0 for none
     float sun[3];    // the way to the sun in the world, a unit vector
+    // What fell in it of late: rings spread over the water from each, and froth stands where a grenade or a shell
+    // went in. x, y and z in the world (the rings are drawn on a water within 40 units of that height); w 0 for none,
+    // else the seconds since it fell (under 16) + 16 times its kind: 1 a bullet, 2 a grenade, 3 a shell.
+    float splash[kWaterSplashes][4];
 };
 void Reflections(const float* m, const float* view, float strength, float seconds, const Water* water = nullptr);
 

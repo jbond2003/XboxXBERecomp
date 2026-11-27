@@ -1228,7 +1228,7 @@ private:
     MirrorView mirror_v_[2];
     bool mirror_ok_ = false;             // this frame's mirroring draws get their second draw (set with placed)
     bool mirror_read_ = false;           // and it reads the last frame's copies (a water drawn whole may go without)
-    float mirror_[14][4] = {};           // DrawConstants::mirror
+    float mirror_[26][4] = {};           // DrawConstants::mirror
     uint64_t mirror_seen_ = UINT64_MAX;  // presents_ of the last frame with a mirroring draw
     // single sample copies of the scene's colour and depth as the last frame's world left them, made while mirroring
     // draws are about
@@ -3779,8 +3779,9 @@ bool D3D12Backend::MirrorReady(const State& s) {
         }
         m[4 + j][3] = place;
     }
+    // (with w the dot with (position, 1) is the height in the world)
     for (int c = 0; c < 3; c++) m[7][c] = a[6 + c];
-    m[7][3] = 0;
+    m[7][3] = -(t[0] * a[6] + t[1] * a[7] + t[2] * a[8]);
     for (int r = 0; r < 2; r++) {
         float place = 0;
         for (int c = 0; c < 3; c++) {
@@ -3794,6 +3795,7 @@ bool D3D12Backend::MirrorReady(const State& s) {
     for (int c = 0; c < 4; c++) m[11][c] = p[20 + c], m[12][c] = p[24 + c];
     for (int c = 0; c < 3; c++) m[13][c] = p[28] * a[c] + p[29] * a[3 + c] + p[30] * a[6 + c];
     m[13][3] = 0;
+    std::memcpy(m[14], p + 32, sizeof(float) * 4 * 12);  // what fell in it
     mirror_ok_ = true;
     return true;
 }

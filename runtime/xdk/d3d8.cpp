@@ -1571,7 +1571,8 @@ void SunShadows(const SunPicture& s) {
 }
 // sent as p: 1 / the projection's x and y scale, its x and y centre, then view z = p[4] / (depth - p[5]), the
 // strength, the clock, then the view matrix's three rows of three and its place; from p[20] the water drawn whole:
-// its colour and how rough (0: none), the sky's colour and the glint, the way to the sun
+// its colour and how rough (0: none), the sky's colour and the glint, the way to the sun, and from p[32] what fell
+// in it
 void Reflections(const float* m, const float* view, float strength, float seconds, const Water* water) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     bool perspective = m[11] == 1.0f && m[15] == 0.0f;
@@ -1585,6 +1586,7 @@ void Reflections(const float* m, const float* view, float strength, float second
         for (int c = 0; c < 3; c++) p[20 + c] = water->tone[c], p[24 + c] = water->sky[c], p[28 + c] = water->sun[c];
         p[23] = water->rough;
         p[27] = water->glint;
+        std::memcpy(p + 32, water->splash, sizeof(water->splash));
     }
     g_backend->Clear(g_state, gpu::kMirrorRects, reinterpret_cast<const uint8_t*>(p), gpu::kClearMirror, 0, 0, 0);
 }
