@@ -945,6 +945,15 @@ bool Discards(const PixelKey& k) {
     return false;
 }
 
+bool Discards(const State& s) {
+    if (s.simple[kMAlphaTestEnable >> 2]) return true;
+    for (int i = 0; i < 4; i++) {
+        if (s.tss[size_t(i)][kTssAlphaKill] == 4) return true;  // D3DTALPHAKILL_ENABLE
+        if (s.ps && ((s.rs[kRsPsTextureModes] >> (i * 5)) & 0x1F) == 5) return true;  // a stage kept whatever is bound
+    }
+    return false;
+}
+
 std::string PixelHlsl(const PixelKey& k) {
     std::string s = Common();
     bool sun = false;

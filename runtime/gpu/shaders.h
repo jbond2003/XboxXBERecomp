@@ -62,6 +62,8 @@ std::string PixelHlsl(const PixelKey& k);
 // PixelHlsl's shader can leave a pixel out (an alpha test, an alpha kill, a clip plane stage): a draw that keeps only
 // depth needs it, any other needs none
 bool Discards(const PixelKey& k);
+// the same from the state alone, before the draw's textures are looked up: what the key adds does not change it
+bool Discards(const State& s);
 // a screen quad's vertex or pixel shader: texture coordinates as the quad was drawn, before its far edges were pulled out
 std::string QuadHlsl(std::string s);
 // depth stored reversed (1 at the near clip, 0 at the far one) from DrawConstants::zparams, for a vertex shader

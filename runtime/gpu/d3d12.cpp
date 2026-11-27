@@ -1160,10 +1160,12 @@ private:
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> blit_psos_;
     Extension* ext_ = nullptr;
     // d3d::SunShadows: the depth kept beside each boosted colour target (the shadow picture), and this frame's values
-    // The shadow picture's depth (d3d::SunShadows): what the world reads, and the part of it that does not move, kept
-    // from the frame that drew it (kSunStill) and copied under what moves in the frames after (kSunMoving)
-    Target sun_w_, sun_s_;
-    int sun_s_id_ = -1;       // the part sun_s_ holds (d3d::SunPicture::id), -1 none
+    // The shadow picture's depth (d3d::SunShadows): what the world reads, and two of the part of it that does not
+    // move: the one copied under what moves (kSunMoving), sun_k_[sun_kept_i_], and the other, which the frames that
+    // draw that part (kSunStill) fill, a share each, to take its place when a frame asks for it by its number
+    Target sun_w_, sun_k_[2];
+    int sun_kept_i_ = 0;
+    int sun_k_id_[2] = {-1, -1};  // the part each holds (d3d::SunPicture::id), -1 none
     bool sun_kept_ = false;   // a frame was made from the kept part, logged once
     float sun_[4 * 5] = {};   // DrawConstants::sun
     int sun_keep_ = kSunWhole, sun_id_ = 0;  // d3d::SunPicture's, this frame
@@ -1598,20 +1600,20 @@ constexpr uint32_t kSunSize = 4096;  // the most texels across the shadow pictur
 // does not ask for it this frame, or it could not be made.
 Target* D3D12Backend::SunDepth(Target& rt, bool clear) {
     if (!sun_on_ || sun_failed_ || !ShadowPicture(rt) || Ms(rt) > 1) return nullptr;
-    if (!MakeSunDepth(sun_w_, rt) || (sun_keep_ != kSunWhole && !MakeSunDepth(sun_s_, rt))) {
+    if (!MakeSunDepth(sun_w_, rt) || (sun_keep_ == kSunStill && !MakeSunDepth(sun_k_[1 - sun_kept_i_], rt))) {
         sun_failed_ = true;
         LOGE("d3d12: no depth for the shadow picture: its shadows are its silhouettes");
         return nullptr;
     }
     if (clear || !sun_begun_) SunBegin();
-    return sun_keep_ == kSunStill ? &sun_s_ : &sun_w_;
+    return sun_keep_ == kSunStill ? &sun_k_[1 - sun_kept_i_] : &sun_w_;
 }
 
 // t as the picture rt's depth, made if it is not or the picture has another size; false if it could not be
 bool D3D12Backend::MakeSunDepth(Target& t, const Target& rt) {
     uint32_t w = std::min(rt.w, kSunSize), h = std::min(rt.h, kSunSize);
     if (t.res && t.w == w && t.h == h) return true;
-    if (t.res) DropSunDepth();  // both: a kept part of another size is no use
+    if (t.res) DropSunDepth();  // all of them: a kept part of another size is no use
     t = Target{};
     t.depth = true;
     t.sun = true;
@@ -1642,7 +1644,8 @@ bool D3D12Backend::MakeSunDepth(Target& t, const Target& rt) {
 
 // This frame's shadow picture started, by what the title said its draws will be (d3d::SunPicture::keep): all of it or
 // only what moves, into the picture the world reads, cleared for all of it and for what moves a copy of the kept part;
-// or only what does not move, into the kept part, cleared, the picture the world reads left as the last frame had it.
+// or what does not move, or a share of it, into the part being made, cleared when its number is new, the picture the
+// world reads left as the last frame had it. The part being made becomes the kept one when a frame asks for it.
 void D3D12Backend::SunBegin() {
     sun_begun_ = true;
     sun_drawn_ = true;
@@ -1651,15 +1654,20 @@ void D3D12Backend::SunBegin() {
         cl_->ClearDepthStencilView(Cpu(dsv_heap_.Get(), t.view, dsv_inc_), D3D12_CLEAR_FLAG_DEPTH, kDepthFar, 0, 0, nullptr);
     };
     if (sun_keep_ == kSunStill) {
-        clear(sun_s_);
-        sun_s_id_ = sun_id_;
+        int made = 1 - sun_kept_i_;
+        if (sun_k_id_[made] != sun_id_) {
+            clear(sun_k_[made]);
+            sun_k_id_[made] = sun_id_;
+        }
         return;
     }
     if (sun_keep_ == kSunMoving) {
-        if (sun_s_id_ == sun_id_) {
-            Transition(sun_s_.res.Get(), sun_s_.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (sun_k_id_[sun_kept_i_] != sun_id_ && sun_k_id_[1 - sun_kept_i_] == sun_id_) sun_kept_i_ = 1 - sun_kept_i_;
+        Target& kept = sun_k_[sun_kept_i_];
+        if (kept.res && sun_k_id_[sun_kept_i_] == sun_id_) {
+            Transition(kept.res.Get(), kept.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
             Transition(sun_w_.res.Get(), sun_w_.state, D3D12_RESOURCE_STATE_COPY_DEST);
-            cl_->CopyResource(sun_w_.res.Get(), sun_s_.res.Get());
+            cl_->CopyResource(sun_w_.res.Get(), kept.res.Get());
             if (!sun_kept_) sun_kept_ = true, LOGR("d3d12: the shadow picture's still part is kept between frames");
             return;
         }
@@ -1669,14 +1677,14 @@ void D3D12Backend::SunBegin() {
 }
 
 void D3D12Backend::DropSunDepth() {
-    for (Target* t : {&sun_w_, &sun_s_}) {
+    for (Target* t : {&sun_w_, &sun_k_[0], &sun_k_[1]}) {
         if (!t->res) continue;
         if (bound_ds_ == t) bound_rt_ = bound_ds_ = nullptr;
         free_dsv_.push_back(t->view);
         CurrentFrame().garbage.push_back(t->res);
         *t = Target{};
     }
-    sun_s_id_ = -1;
+    sun_k_id_[0] = sun_k_id_[1] = -1;
 }
 
 // a view from the free pool, cleared; false when the pool is empty
@@ -3593,6 +3601,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // mark laid on the ground): it casts nothing a depth test would make solid, and is not drawn.
     bool into_sun = bound_ds_ && bound_ds_->sun;
     if (into_sun && SimpleState(s, kMBlendEnable) && !SimpleState(s, kMAlphaTestEnable)) return;
+    // And there a pixel shader is run only where it can leave a pixel out (a fence's or a tree's cut-out). The rest is
+    // depth alone, from the vertex shader: no pixel shader, and none of the work on the stages' textures, which some
+    // hundreds of pieces of a level would each have looked up for nothing.
+    bool depth_only = into_sun && !bound_rt_ && !Discards(s);
 
     // vertex shader
     DrawShaders sh = ClassifyShaders(s, a, count);
@@ -3601,20 +3613,18 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     EnsureVertexShader(s, a, sh);
 
     // stage textures, then the pixel shader made for them
-    DrawTextures stages;
-    if (!BindStageTexturesAndTargets(s, stages)) return;
-    PixelKey pk = MakePixelKey(s, stages.info);
-    pk.quad = sh.quad;
-    // and there a pixel shader is run only where it can leave a pixel out (a fence's or a tree's cut-out): the rest
-    // is depth alone, from the vertex shader
-    bool depth_only = bound_ds_ && bound_ds_->sun && !bound_rt_ && !Discards(pk);
+    DrawTextures stages{};
+    PixelKey pk;
     if (!depth_only) {
+        if (!BindStageTexturesAndTargets(s, stages)) return;
+        pk = MakePixelKey(s, stages.info);
+        pk.quad = sh.quad;
         sh.pkey = Hash(&pk, sizeof(pk));
         EnsurePixelShader(pk, sh);
-    }
-    if (!depth_only && !sh.ps_code && !sun_failed_ && std::any_of(std::begin(pk.tex), std::end(pk.tex), [](const TexInfo& t) { return t.flags & kTexSun; })) {
-        sun_failed_ = true;  // from the next draw the picture's alpha, as before
-        LOGE("d3d12: the shadow picture's depth test did not compile: its shadows are its silhouettes");
+        if (!sh.ps_code && !sun_failed_ && std::any_of(std::begin(pk.tex), std::end(pk.tex), [](const TexInfo& t) { return t.flags & kTexSun; })) {
+            sun_failed_ = true;  // from the next draw the picture's alpha, as before
+            LOGE("d3d12: the shadow picture's depth test did not compile: its shadows are its silhouettes");
+        }
     }
     if (!sh.vs_code || (!sh.ps_code && !depth_only)) return;
 
@@ -3642,7 +3652,8 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
 
     // texture views and samplers, viewport and scissor, blend factor and stencil reference
-    SetTextureViewsAndSamplers(s, a, stages);
+    // (depth alone reads none: the tables are set, empty, only on a list that has none yet)
+    if (!depth_only || binds_.views == UINT32_MAX || binds_.samplers == UINT32_MAX) SetTextureViewsAndSamplers(s, a, stages);
     SetViewportScissor(s, size.w);
     SetBlendFactorStencilRef(s);
 

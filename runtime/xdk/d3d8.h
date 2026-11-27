@@ -30,11 +30,13 @@ void Occlusion(const float* m, bool gtao, float radius, float strength, const fl
 // with no colour. A title whose picture holds much that does not move (a level's meshes) need not draw that every
 // frame, while the picture's camera stays where it is: SunPicture::keep says what this frame's draws into it are.
 //   kSunWhole   all of it, as a title that keeps nothing draws it
-//   kSunStill   only what does not move, kept by the renderer as part number id. This frame's world still reads the
-//               picture as the frame before left it, whose camera may have been another: across, up and from give
-//               that picture's u, v and depth from this frame's stage coordinates
-//   kSunMoving  only what moves, drawn over a copy of the kept part number id. Where the renderer no longer holds
-//               that part (gpu::g_sun_static_lost counts up) the frame's picture has what moves alone
+//   kSunStill   only what does not move, or a share of it: added to the part the renderer is making under the
+//               number id (begun empty when the number is new). This frame's world still reads the picture as the
+//               frame before left it, whose camera may have been another: across, up and from give that picture's
+//               u, v and depth from this frame's stage coordinates
+//   kSunMoving  only what moves, drawn over a copy of the part number id: the one kept so far, or the one being
+//               made, which then is the kept one. Where the renderer holds neither under that number
+//               (gpu::g_sun_static_lost counts up) the frame's picture has what moves alone
 // In kSunWhole and kSunMoving across and up are {1, 0, 0, 0} and {0, 1, 0, 0}: the stage's own u and v.
 // fade: the picture's shadows end, fading over a twentieth of it, fade[2] inside the square that lies fade[0], fade[1]
 // from the picture's own in u and v: a kept picture's camera lags the place the title would put it, and the square
