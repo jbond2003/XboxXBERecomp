@@ -94,8 +94,9 @@ inline std::atomic<bool> g_smaa_off{false};
 // makes it, up to 4096 host pixels: a title's shadow picture laid over more of the world than it was made for
 inline std::atomic<uint32_t> g_boost_size{0};
 inline std::atomic<float> g_boost{1.0f};
-// Set by the renderer while the shadow picture keeps its depth as d3d::SunShadows asks (a depth target made beside
-// it, its shaders compiled): a title puts in the picture what only a depth test can tell apart from what it falls on
+// Set by the renderer once the shadow picture keeps its depth as d3d::SunShadows asks (a depth target made beside
+// it), cleared if that fails later (a shader that reads it did not compile): in a frame it sends SunShadows a title
+// puts in the picture what only a depth test can tell apart from what it falls on
 inline std::atomic<bool> g_sun_depth_ok{false};
 
 // F3: save the next frame, every draw and target, under diag::CaptureDir

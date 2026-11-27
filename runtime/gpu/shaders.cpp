@@ -55,7 +55,6 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 lt[56];
     float4 rtshift;
     float4 zparams;
-    float4 sun[2];
 };
 )";
 
@@ -499,38 +498,6 @@ float4 spreadtap(Texture2D t, SamplerState s, float2 uv, float4 w, float m) {
         }
     return c / (n * n);
 }
-// The shadow picture read by its depth (kTexSun, d3d::SunShadows): p the stage's coordinates over their w, uv where
-// they read the picture. A point is in shadow where the picture holds something nearer its camera: its own depth is
-// sun[0] . (p, 1), 0 at the picture's near plane and 1 at its far one, and the picture holds 1 less that (depth is
-// stored reversed). 3 x 3 gathers 2 texels apart, a box 6 texels across, each texel tested along the receiver's
-// own plane (its slope in depth per uv from the screen derivatives, at most sun[1].w) less the bias sun[1].z.
-// light: the surface's baked light (kTexSunLight), darkened only down to the shade sun[1].y. Handed on as the
-// silhouette picture's alpha (black, alpha the shadow) times sun[1].x.
-float4 sunshadow(Texture2D t, SamplerState s, float3 p, float2 uv, float4 light) {
-    float z = dot(float4(p, 1), sun[0]);
-    float2 ux = ddx(uv), uy = ddy(uv);
-    float zx = ddx(z), zy = ddy(z);
-    if (any(uv <= 0) || any(uv >= 1) || !(z > 0 && z < 1)) return 0;
-    float w, h;
-    t.GetDimensions(w, h);
-    float2 texel = 1 / float2(w, h);
-    float det = ux.x * uy.y - ux.y * uy.x;
-    float2 slope = abs(det) > 1e-24 ? float2(uy.y * zx - ux.y * zy, ux.x * zy - uy.x * zx) / det : 0;
-    slope = clamp(slope, -sun[1].w, sun[1].w);
-    // reversed: lit where the picture holds no more than 1 - (z - bias), a texel's slope taken off for its rounding
-    float ref = 1 - z + sun[1].z + dot(abs(slope), texel);
-    float lit = 0;
-    [unroll] for (int y = -1; y <= 1; y++) {
-        [unroll] for (int x = -1; x <= 1; x++) {
-            float2 o = float2(x, y) * 2 * texel;
-            float4 g = t.GatherRed(s, uv + o);
-            lit += dot(step(g, ref - dot(slope, o)), float4(1, 1, 1, 1));
-        }
-    }
-    float shadow = 1 - lit / 36;
-    if (sun[1].y > 0) shadow *= saturate(1 - sun[1].y / max(dot(light.rgb, float3(1, 1, 1)) / 3, 1e-3));
-    return float4(0, 0, 0, shadow * sun[1].x);
-}
 void alphatest(float a) {
     int f = (int)misc.y;
     int v = (int)round(a * 255), r = (int)misc.x;
@@ -538,6 +505,48 @@ void alphatest(float a) {
     if (!ok) discard;
 }
 )";
+
+const char* kPsSun = R"(// The shadow picture read by its depth (kTexSun, d3d::SunShadows): p the stage's coordinates over their w, uv where
+// they read the picture. A point is in shadow where the picture holds something nearer its camera: its own depth is
+// sun[0] . (p, 1), 0 at the picture's near plane and 1 at its far one, and the picture holds 1 less that (depth is
+// stored reversed). 3 x 3 gathers 2 texels apart, a box 6 texels across, each texel tested along the receiver's
+// own plane (its slope in depth per uv from the screen derivatives, at most sun[1].w) less the bias sun[1].z.
+// light: the surface's baked light (kTexSunLight), darkened only down to the shade sun[1].y. Handed on as the
+// silhouette picture's alpha (black, alpha the shadow) times sun[1].x.
+// Only in the shaders that read it (PixelHlsl), with its two constants at the end of the draw's: every other shader's
+// text, and so its place in the cache of compiled ones, is as it was.
+float4 sunshadow(Texture2D t, SamplerState s, float3 p, float2 uv, float4 light) {
+    float z = dot(float4(p, 1), sun[0]);
+    float2 ux = ddx(uv), uy = ddy(uv);
+    float zx = ddx(z), zy = ddy(z);
+    if (any(uv <= 0) || any(uv >= 1) || !(z > 0 && z < 1)) return float4(0, 0, 0, 0);
+    float w, h;
+    t.GetDimensions(w, h);
+    float2 texel = 1 / float2(w, h);
+    float det = ux.x * uy.y - ux.y * uy.x;
+    float2 slope = float2(0, 0);
+    if (abs(det) > 1e-24) slope = float2(uy.y * zx - ux.y * zy, ux.x * zy - uy.x * zx) / det;
+    slope = clamp(slope, -sun[1].w, sun[1].w);
+    // reversed: lit where the picture holds no more than 1 - (z - bias), a texel's slope taken off for its rounding
+    float limit = 1 - z + sun[1].z + dot(abs(slope), texel);
+    float open = 0;
+    [unroll] for (int y = -1; y <= 1; y++) {
+        [unroll] for (int x = -1; x <= 1; x++) {
+            float2 o = float2(x, y) * 2 * texel;
+            float4 g = t.GatherRed(s, uv + o);
+            open += dot(step(g, limit - dot(slope, o)), float4(1, 1, 1, 1));
+        }
+    }
+    // nothing at the picture's edges and far end, coming in over a twentieth of it: no line where it stops
+    float2 e = min(uv, 1 - uv);
+    float dark = (1 - open / 36) * saturate(min(min(e.x, e.y), 1 - z) * 20);
+    if (sun[1].y > 0) dark *= saturate(1 - sun[1].y / max(dot(light.rgb, float3(1, 1, 1)) / 3, 1e-3));
+    return float4(0, 0, 0, dark * sun[1].x);
+}
+)";
+// kCommonTail's end, and the same with sunshadow's constants (DrawConstants::sun)
+const char* kConstantsEnd = "    float4 zparams;\n};\n";
+const char* kConstantsEndSun = "    float4 zparams;\n    float4 sun[2];\n};\n";
 
 std::string PsHelpers() { return kPsSbyte + Hooks().Shadow() + kPsTail; }
 
@@ -916,7 +925,14 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
 
 std::string PixelHlsl(const PixelKey& k) {
     std::string s = Common();
+    bool sun = false;
+    for (const TexInfo& t : k.tex) sun = sun || (t.flags & kTexSun);
+    if (sun) {
+        size_t end = s.rfind(kConstantsEnd);
+        if (end != std::string::npos) s.replace(end, std::strlen(kConstantsEnd), kConstantsEndSun);
+    }
     s += PsHelpers();
+    if (sun) s += kPsSun;
     for (int i = 0; i < 4; i++) {
         const TexInfo& t = k.tex[i];
         const char* type = t.shadow ? "Texture2D<float>" : t.kind == kTex3D ? "Texture3D" : t.kind == kTexCube ? "TextureCube" : "Texture2D";
