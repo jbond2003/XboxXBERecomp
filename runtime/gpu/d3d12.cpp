@@ -209,25 +209,34 @@ float3 View(float2 px) {
     float2 ndc = (p + 0.5 - vp.xy) / vp.zw * float2(2, -2) + float2(-1, 1);
     return float3((ndc - proj.zw) * proj.xy * z, z);
 }
+// the pixels beside a pixel, left, right, up and down: read once for its normal and for Thin
+struct Sides { float3 l, r, u, d; };
+Sides Beside(float2 pos) {
+    Sides q;
+    q.l = View(pos - float2(1, 0));
+    q.r = View(pos + float2(1, 0));
+    q.u = View(pos - float2(0, 1));
+    q.d = View(pos + float2(0, 1));
+    return q;
+}
+// a pixel's view z alone
+float Deep(float2 px) {
+    int2 p = clamp(int2(px), int2(vp.xy), int2(vp.xy + vp.zw) - 1);
+    return zp.x / (zp.y - Raw(p));
+}
 // normal from the nearer neighbour each way: no bend over depth edges
-float3 Normal(float2 pos, float3 c) {
-    float3 l = View(pos - float2(1, 0));
-    float3 r = View(pos + float2(1, 0));
-    float3 u = View(pos - float2(0, 1));
-    float3 d = View(pos + float2(0, 1));
-    float3 dx = abs(r.z - c.z) < abs(c.z - l.z) ? r - c : c - l;
-    float3 dy = abs(d.z - c.z) < abs(c.z - u.z) ? d - c : c - u;
+float3 Normal(Sides q, float3 c) {
+    float3 dx = abs(q.r.z - c.z) < abs(c.z - q.l.z) ? q.r - c : c - q.l;
+    float3 dy = abs(q.d.z - c.z) < abs(c.z - q.u.z) ? q.d - c : c - q.u;
     return normalize(cross(dx, dy));
 }
 // 1 on a thing a few pixels thin that stands in front of what is behind it on both sides: a blade of grass, a wire.
 // Its normal from the depth is noise and everything about it reads as an occluder, so it is left unshaded.
-float Thin(float2 pos, float3 c) {
-    float m = 0;
-    for (int i = 1; i <= 2; i++) {
-        float x = min(View(pos - float2(i, 0)).z, View(pos + float2(i, 0)).z) - c.z;
-        float y = min(View(pos - float2(0, i)).z, View(pos + float2(0, i)).z) - c.z;
-        m = max(m, max(x, y));
-    }
+// The pixels one away are the normal's, the pixels two away are read here.
+float Thin(float2 pos, Sides q, float3 c) {
+    float x = max(min(q.l.z, q.r.z), min(Deep(pos - float2(2, 0)), Deep(pos + float2(2, 0)))) - c.z;
+    float y = max(min(q.u.z, q.d.z), min(Deep(pos - float2(0, 2)), Deep(pos + float2(0, 2)))) - c.z;
+    float m = max(0, max(x, y));
     return saturate(m / max(c.z * 0.01, 1e-4) - 1);
 }
 // A sample's reach: one nearer the eye than the pixel counts as twice as far, so a thin thing in front (grass, a
@@ -240,19 +249,22 @@ float3 Reach(float3 d) { return float3(d.xy, d.z < 0 ? d.z * 2 : d.z); }
 float Rise(float h, float R) { return saturate(h / max(sqrt(opt.x * R) * 0.08, 1e-4) - 1); }
 static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
 // opt: world radius, most pixels it may span; out: occlusion, view z
+// 12 samples on a spiral, turned by the pixel's place in a 4 x 4 pattern that the blur passes average: 16 gave the
+// same shade for a third more reads
 float2 occlusion(float4 pos : SV_Position) : SV_Target {
     float3 c = View(pos.xy);
     float2 rad = opt.x * 0.5 * vp.zw / (proj.xy * c.z);
     float span = max(rad.x, rad.y);
     if (span < 1) return float2(1, c.z);
-    float3 n = Normal(pos.xy, c);
+    Sides q = Beside(pos.xy);
+    float3 n = Normal(q, c);
     float k = min(1, opt.y / span);
     float R = opt.x * k;
     int2 cell = int2(pos.xy) & 3;
     float turn = kDither[cell.y * 4 + cell.x] * (6.2831853 / 16);
     float a = 0;
-    for (int i = 0; i < 16; i++) {
-        float f = (i + 0.5) / 16;
+    for (int i = 0; i < 12; i++) {
+        float f = (i + 0.5) / 12;
         float t = i * 2.3999632 + turn;
         float3 v = (View(pos.xy + float2(cos(t), sin(t)) * rad * (k * f)) - c) / R;
         float3 rv = Reach(v);
@@ -260,7 +272,7 @@ float2 occlusion(float4 pos : SV_Position) : SV_Target {
         float w = max(1 - vv, 0);
         a += w * w * w * max((dot(v, n) - 0.05) / (vv + 0.01), 0) * Rise(dot(v, n) * R, R);
     }
-    return float2(lerp(max(1 - a * 0.25, 0), 1, Thin(pos.xy, c)), c.z);
+    return float2(lerp(max(1 - a / 3, 0), 1, Thin(pos.xy, q, c)), c.z);
 }
 static const float kHalfPi = 1.5707963;
 // GTAO (Jimenez 2016) at XeGTAO's high preset: 3 slices, 3 steps a side, squared step spread, falloff over the outer
@@ -271,7 +283,8 @@ float2 gtao(float4 pos : SV_Position) : SV_Target {
     float2 rad = opt.x * 0.5 * vp.zw / (proj.xy * c.z);
     float span = max(rad.x, rad.y);
     if (span < 1) return float2(1, c.z);
-    float3 n = Normal(pos.xy, c);
+    Sides q = Beside(pos.xy);
+    float3 n = Normal(q, c);
     float3 v = normalize(-c);
     float k = min(1, opt.y / span);
     float R = opt.x * k;
@@ -312,7 +325,7 @@ float2 gtao(float4 pos : SV_Position) : SV_Target {
         float arc1 = (cos_n + 2 * h1 * sin_n - cos(2 * h1 - an)) / 4;
         vis += pn_len * (arc0 + arc1);
     }
-    return float2(lerp(pow(saturate(vis / 3), 2.2), 1, Thin(pos.xy, c)), c.z);
+    return float2(lerp(pow(saturate(vis / 3), 2.2), 1, Thin(pos.xy, q, c)), c.z);
 }
 // opt.zw: step; 5 taps average the 4 pixel dither, depth edges left out
 float Smooth(float2 pos, out float z) {
