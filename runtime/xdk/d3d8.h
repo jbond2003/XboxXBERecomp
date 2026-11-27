@@ -1,6 +1,7 @@
 #pragma once
 #include <mutex>
 
+#include "gpu/backend.h"
 #include "gpu/state.h"
 
 namespace d3d {
@@ -24,7 +25,29 @@ void Occlusion(const float* m, bool gtao, float radius, float strength, const fl
 // times this; shade: where the stage before the picture's holds baked light, the shadow darkens it only to this level
 // (0: not); bias: a receiver is lit up to this much depth behind what the picture holds; slope: the most depth per
 // unit of u or v a receiver's plane is taken to have. gpu::g_sun_depth_ok says when it works.
-void SunShadows(const float from[4], float gain, float shade, float bias, float slope);
+//
+// The picture's depth is a target of the renderer's own, and what is drawn into the picture is drawn into that only,
+// with no colour. A title whose picture holds much that does not move (a level's meshes) need not draw that every
+// frame, while the picture's camera stays where it is: SunPicture::keep says what this frame's draws into it are.
+//   kSunWhole   all of it, as a title that keeps nothing draws it
+//   kSunStill   only what does not move, kept by the renderer as part number id. This frame's world still reads the
+//               picture as the frame before left it, whose camera may have been another: across, up and from give
+//               that picture's u, v and depth from this frame's stage coordinates
+//   kSunMoving  only what moves, drawn over a copy of the kept part number id. Where the renderer no longer holds
+//               that part (gpu::g_sun_static_lost counts up) the frame's picture has what moves alone
+// In kSunWhole and kSunMoving across and up are {1, 0, 0, 0} and {0, 1, 0, 0}: the stage's own u and v.
+// fade: the picture's shadows end, fading over a twentieth of it, fade[2] inside the square that lies fade[0], fade[1]
+// from the picture's own in u and v: a kept picture's camera lags the place the title would put it, and the square
+// the shadows end at need not jump with it.
+using gpu::SunKeep, gpu::kSunWhole, gpu::kSunMoving, gpu::kSunStill;
+struct SunPicture {
+    float across[4] = {1, 0, 0, 0}, up[4] = {0, 1, 0, 0}, from[4] = {};
+    float gain = 1, shade = 0, bias = 0, slope = 0;
+    float fade[3] = {};
+    SunKeep keep = kSunWhole;
+    int id = 0;
+};
+void SunShadows(const SunPicture& p);
 // the title's thread, after SunShadows and before this frame's Occlusion: where the scene's view space lies in the
 // shadow picture, three rows of four taking (x, y, z, 1) of view space to the picture's u, v and depth (as
 // SunShadows' from gives it). In the sun the shade takes away only keep of what it does out of it (the ambient light it

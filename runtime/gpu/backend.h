@@ -25,7 +25,9 @@ enum : uint32_t {
     kClearSunView = 0x400,
 };
 constexpr uint32_t kOcclusionRects = 4;
-constexpr uint32_t kSunRects = 2;
+constexpr uint32_t kSunRects = 6;
+// what a frame's draws into the shadow picture are (d3d::SunPicture::keep)
+enum SunKeep : int { kSunWhole = 0, kSunMoving = 1, kSunStill = 2 };
 constexpr uint32_t kSunViewRects = 4;
 
 class Backend {
@@ -98,6 +100,9 @@ inline std::atomic<float> g_boost{1.0f};
 // it), cleared if that fails later (a shader that reads it did not compile): in a frame it sends SunShadows a title
 // puts in the picture what only a depth test can tell apart from what it falls on
 inline std::atomic<bool> g_sun_depth_ok{false};
+// Counted up by the renderer each time a frame asked for the kept part of the shadow picture (d3d::kSunMoving) and it
+// did not hold the part asked for: the title draws that part again (d3d::kSunStill)
+inline std::atomic<uint32_t> g_sun_static_lost{0};
 
 // F3: save the next frame, every draw and target, under diag::CaptureDir
 inline std::atomic<bool> g_capture{false};

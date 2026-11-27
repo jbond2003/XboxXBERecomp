@@ -1558,11 +1558,15 @@ void SunOcclusion(const float view_to_sun[12], float keep, float bias) {
     g_backend->Clear(g_state, gpu::kSunViewRects, reinterpret_cast<const uint8_t*>(p), gpu::kClearSunView, 0, 0, 0);
 }
 
-// sent as p: from, then gain, shade, bias, slope
-void SunShadows(const float from[4], float gain, float shade, float bias, float slope) {
+// sent as p, fours: from; gain, shade, bias, slope; across; up; fade; keep, id (the first five are the shaders')
+void SunShadows(const SunPicture& s) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (!g_backend) return;
-    const float p[4 * gpu::kSunRects] = {from[0], from[1], from[2], from[3], gain, shade, bias, slope};
+    float p[4 * gpu::kSunRects] = {};
+    for (int i = 0; i < 4; i++) p[i] = s.from[i], p[8 + i] = s.across[i], p[12 + i] = s.up[i];
+    p[4] = s.gain, p[5] = s.shade, p[6] = s.bias, p[7] = s.slope;
+    for (int i = 0; i < 3; i++) p[16 + i] = s.fade[i];
+    p[20] = float(s.keep), p[21] = float(s.id);
     g_backend->Clear(g_state, gpu::kSunRects, reinterpret_cast<const uint8_t*>(p), gpu::kClearSun, 0, 0, 0);
 }
 }  // namespace d3d

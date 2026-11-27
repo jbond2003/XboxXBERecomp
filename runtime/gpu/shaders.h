@@ -59,6 +59,9 @@ struct FixedKey {
 FixedKey MakeFixedKey(const State& s);
 std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode = 0, const FixedKey& f = {});
 std::string PixelHlsl(const PixelKey& k);
+// PixelHlsl's shader can leave a pixel out (an alpha test, an alpha kill, a clip plane stage): a draw that keeps only
+// depth needs it, any other needs none
+bool Discards(const PixelKey& k);
 // a screen quad's vertex or pixel shader: texture coordinates as the quad was drawn, before its far edges were pulled out
 std::string QuadHlsl(std::string s);
 // depth stored reversed (1 at the near clip, 0 at the far one) from DrawConstants::zparams, for a vertex shader
@@ -108,7 +111,7 @@ struct DrawConstants {
     float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
     float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
     float zparams[4];    // ReversedDepthHlsl: a w buffer's scale (0 for a z buffer), its far w, the polygon offset
-    float sun[2][4];     // kTexSun: d3d::SunShadows' from, then gain, shade, bias, slope
+    float sun[5][4];     // kTexSun, d3d::SunShadows: from; gain, shade, bias, slope; across; up; fade
 };
 
 }  // namespace gpu

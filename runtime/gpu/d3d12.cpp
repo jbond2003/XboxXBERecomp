@@ -1160,18 +1160,25 @@ private:
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> blit_psos_;
     Extension* ext_ = nullptr;
     // d3d::SunShadows: the depth kept beside each boosted colour target (the shadow picture), and this frame's values
-    std::unordered_map<const Target*, Target> sun_ds_;
-    float sun_[4 * kSunRects] = {};
+    // The shadow picture's depth (d3d::SunShadows): what the world reads, and the part of it that does not move, kept
+    // from the frame that drew it (kSunStill) and copied under what moves in the frames after (kSunMoving)
+    Target sun_w_, sun_s_;
+    int sun_s_id_ = -1;       // the part sun_s_ holds (d3d::SunPicture::id), -1 none
+    bool sun_kept_ = false;   // a frame was made from the kept part, logged once
+    float sun_[4 * 5] = {};   // DrawConstants::sun
+    int sun_keep_ = kSunWhole, sun_id_ = 0;  // d3d::SunPicture's, this frame
     bool sun_on_ = false;     // sent this frame
+    bool sun_begun_ = false;  // this frame's picture was started: cleared, or brought from the kept part
     bool sun_drawn_ = false;  // a picture was cleared or drawn with its depth this frame
     bool sun_works_ = false;  // one was, in some frame
     bool sun_failed_ = false;  // no depth target, or its shaders did not compile: the picture's alpha as before
     bool sun_shade_failed_ = false;  // the ambient occlusion's pass that reads it did not compile: the plain one
-    Target* sun_last_ = nullptr;  // the picture's depth last drawn into this frame
     float sun_view_[4 * kSunViewRects] = {};  // d3d::SunOcclusion's
     bool sun_view_on_ = false;
-    Target* SunDepth(Target& rt);
-    void DropSunDepth(const Target* rt);
+    Target* SunDepth(Target& rt, bool clear = false);
+    bool MakeSunDepth(Target& t, const Target& rt);
+    void SunBegin();
+    void DropSunDepth();
     // one frame capture: every draw in a text file, each target as the frame leaves it, the textures it read
     FILE* cap_ = nullptr;
     std::filesystem::path cap_dir_;
@@ -1529,7 +1536,6 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
 
 // a resized target gives back its view and its resources
 void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it) {
-    DropSunDepth(&it->second);
     if (bound_rt_ == &it->second || bound_ds_ == &it->second) bound_rt_ = bound_ds_ = nullptr;
     (it->second.depth ? free_dsv_ : free_rtv_).push_back(it->second.view);
     CurrentFrame().garbage.push_back(it->second.res);
@@ -1578,19 +1584,38 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
     return true;
 }
 
-// The shadow picture's depth (d3d::SunShadows): a depth target the size of the picture's colour target rt, made once,
-// bound with it for every draw into it. Null while the title does not ask for it this frame or it could not be made.
-Target* D3D12Backend::SunDepth(Target& rt) {
-    // the title's shadow picture: the size it names for g_boost, made larger or not
-    bool picture = rt.gw == rt.gh && rt.gw == g_boost_size.load(std::memory_order_relaxed);
-    if (!sun_on_ || sun_failed_ || !picture || rt.depth || Ms(rt) > 1) return nullptr;
-    auto it = sun_ds_.find(&rt);
-    if (it != sun_ds_.end() && it->second.w == rt.w && it->second.h == rt.h) return &it->second;
-    DropSunDepth(&rt);
-    Target t;
+// the title's shadow picture: a colour target of the size it names for g_boost, made larger or not
+bool ShadowPicture(const Target& t) {
+    return !t.depth && !t.sun && t.gw && t.gw == t.gh && t.gw == g_boost_size.load(std::memory_order_relaxed);
+}
+
+constexpr uint32_t kSunSize = 4096;  // the most texels across the shadow picture's depth
+
+// The shadow picture's depth (d3d::SunShadows): where a draw into the picture's colour target rt goes while the title
+// asks for it, with no colour. Depth targets of the renderer's own, no larger than kSunSize across (the colour
+// picture is made up to twice that, to be read sharp; a depth compared over a box of texels need not be). The
+// frame's first use starts its picture (SunBegin), and a clear of the picture starts it again. Null while the title
+// does not ask for it this frame, or it could not be made.
+Target* D3D12Backend::SunDepth(Target& rt, bool clear) {
+    if (!sun_on_ || sun_failed_ || !ShadowPicture(rt) || Ms(rt) > 1) return nullptr;
+    if (!MakeSunDepth(sun_w_, rt) || (sun_keep_ != kSunWhole && !MakeSunDepth(sun_s_, rt))) {
+        sun_failed_ = true;
+        LOGE("d3d12: no depth for the shadow picture: its shadows are its silhouettes");
+        return nullptr;
+    }
+    if (clear || !sun_begun_) SunBegin();
+    return sun_keep_ == kSunStill ? &sun_s_ : &sun_w_;
+}
+
+// t as the picture rt's depth, made if it is not or the picture has another size; false if it could not be
+bool D3D12Backend::MakeSunDepth(Target& t, const Target& rt) {
+    uint32_t w = std::min(rt.w, kSunSize), h = std::min(rt.h, kSunSize);
+    if (t.res && t.w == w && t.h == h) return true;
+    if (t.res) DropSunDepth();  // both: a kept part of another size is no use
+    t = Target{};
     t.depth = true;
     t.sun = true;
-    t.gw = rt.gw, t.gh = rt.gh, t.w = rt.w, t.h = rt.h, t.data = rt.data;
+    t.gw = rt.gw, t.gh = rt.gh, t.w = w, t.h = h, t.data = rt.data;
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC td = Texture2DDesc(kSunDepthTypeless, t.w, t.h);
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -1600,9 +1625,8 @@ Target* D3D12Backend::SunDepth(Target& rt) {
     t.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     if (free_dsv_.empty() ||
         FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, t.state, &cv, IID_PPV_ARGS(&t.res)))) {
-        sun_failed_ = true;
-        LOGE("d3d12: no %ux%u depth for the shadow picture: its shadows are its silhouettes", t.w, t.h);
-        return nullptr;
+        t = Target{};
+        return false;
     }
     t.view = free_dsv_.back();
     free_dsv_.pop_back();
@@ -1612,18 +1636,47 @@ Target* D3D12Backend::SunDepth(Target& rt) {
     D3D12_CPU_DESCRIPTOR_HANDLE dh = Cpu(dsv_heap_.Get(), t.view, dsv_inc_);
     dev_->CreateDepthStencilView(t.res.Get(), &dv, dh);
     cl_->ClearDepthStencilView(dh, D3D12_CLEAR_FLAG_DEPTH, kDepthFar, 0, 0, nullptr);
-    LOGR("d3d12: the shadow picture keeps its depth, %ux%u", t.w, t.h);
-    return &(sun_ds_[&rt] = std::move(t));
+    if (&t == &sun_w_) LOGR("d3d12: the shadow picture keeps its depth, %ux%u", t.w, t.h);
+    return true;
 }
 
-void D3D12Backend::DropSunDepth(const Target* rt) {
-    auto it = sun_ds_.find(rt);
-    if (it == sun_ds_.end()) return;
-    if (bound_ds_ == &it->second) bound_rt_ = bound_ds_ = nullptr;
-    if (sun_last_ == &it->second) sun_last_ = nullptr;
-    free_dsv_.push_back(it->second.view);
-    CurrentFrame().garbage.push_back(it->second.res);
-    sun_ds_.erase(it);
+// This frame's shadow picture started, by what the title said its draws will be (d3d::SunPicture::keep): all of it or
+// only what moves, into the picture the world reads, cleared for all of it and for what moves a copy of the kept part;
+// or only what does not move, into the kept part, cleared, the picture the world reads left as the last frame had it.
+void D3D12Backend::SunBegin() {
+    sun_begun_ = true;
+    sun_drawn_ = true;
+    auto clear = [&](Target& t) {
+        Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        cl_->ClearDepthStencilView(Cpu(dsv_heap_.Get(), t.view, dsv_inc_), D3D12_CLEAR_FLAG_DEPTH, kDepthFar, 0, 0, nullptr);
+    };
+    if (sun_keep_ == kSunStill) {
+        clear(sun_s_);
+        sun_s_id_ = sun_id_;
+        return;
+    }
+    if (sun_keep_ == kSunMoving) {
+        if (sun_s_id_ == sun_id_) {
+            Transition(sun_s_.res.Get(), sun_s_.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Transition(sun_w_.res.Get(), sun_w_.state, D3D12_RESOURCE_STATE_COPY_DEST);
+            cl_->CopyResource(sun_w_.res.Get(), sun_s_.res.Get());
+            if (!sun_kept_) sun_kept_ = true, LOGR("d3d12: the shadow picture's still part is kept between frames");
+            return;
+        }
+        g_sun_static_lost.fetch_add(1, std::memory_order_relaxed);  // the title draws that part again
+    }
+    clear(sun_w_);
+}
+
+void D3D12Backend::DropSunDepth() {
+    for (Target* t : {&sun_w_, &sun_s_}) {
+        if (!t->res) continue;
+        if (bound_ds_ == t) bound_rt_ = bound_ds_ = nullptr;
+        free_dsv_.push_back(t->view);
+        CurrentFrame().garbage.push_back(t->res);
+        *t = Target{};
+    }
+    sun_s_id_ = -1;
 }
 
 // a view from the free pool, cleared; false when the pool is empty
@@ -1738,8 +1791,9 @@ bool D3D12Backend::BindTargets(const State& s) {
     Target* ds = s.rs[kRsZEnable] || s.rs[kRsStencilEnable] ? EnsureTarget(s.zs, true) : nullptr;
     if (rt && ds && (rt->w != ds->w || rt->h != ds->h || Ms(*rt) != Ms(*ds))) ds = nullptr;
     if (rt && !ds) {
+        // the shadow picture while its depth is kept: into that alone, no colour
         ds = SunDepth(*rt);
-        if (ds) sun_drawn_ = true, sun_last_ = ds;
+        if (ds) rt = nullptr;
     }
     if (!rt && !ds) return false;
     if (rt) {
@@ -2236,7 +2290,7 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
                                     D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const {
     d.pRootSignature = root_.Get();
     d.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
-    d.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    if (ps) d.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};  // none: depth only (the shadow picture's)
     auto& b = d.BlendState.RenderTarget[0];
     b.BlendEnable = k.blend;
     b.SrcBlend = Blend(k.src, false);
@@ -2339,21 +2393,22 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
     D3D12_SHADER_RESOURCE_VIEW_DESC& sv = stages.sv[stage];
     if (&t == draw_ds_) return nullptr;
     bool feedback = &t == draw_rt_;
-    // Into the shadow picture with its depth kept, nothing reads the picture itself: the level's meshes are drawn into
-    // it with it still on their stages, as the world reads it, and the copy a draw gets of the target it reads
-    // (Feedback), the whole picture for each of some hundreds of draws, would be made for nothing.
-    if (feedback && draw_ds_ && draw_ds_->sun) return nullptr;
-    // the shadow picture read by its depth (d3d::SunShadows), not while drawing into it
-    auto sd = sun_on_ && !sun_failed_ && !feedback ? sun_ds_.find(&t) : sun_ds_.end();
-    if (sd != sun_ds_.end()) {
+    bool sun = sun_on_ && !sun_failed_ && sun_w_.res && !feedback && ShadowPicture(t);
+    // Into the shadow picture's depth nothing reads the picture: the level's meshes are drawn into it with it still on
+    // their stages, as the world reads it.
+    if (sun && draw_ds_ && draw_ds_->sun) return nullptr;
+    // the shadow picture read by its depth (d3d::SunShadows). Read before anything cleared or drew it this frame (a
+    // frame with nothing to put in it), it is started here: what moved in the last frame is not left in it.
+    if (sun) {
+        if (!sun_begun_ && sun_keep_ != kSunStill) SunBegin();
         stages.rt[stage] = true;
         info.kind = kTex2D;
         info.flags |= kTexTarget | kTexSun;
         bool light = stage > 0 && stages.res[stage - 1] && stages.info[stage - 1].kind == kTex2D && !stages.rt[stage - 1];
         if (light) info.flags |= kTexSunLight;
         sv.Format = kSunDepthRead;
-        Transition(sd->second.res.Get(), sd->second.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        return sd->second.res.Get();
+        Transition(sun_w_.res.Get(), sun_w_.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        return sun_w_.res.Get();
     }
     stages.rt[stage] = true;
     stages.smooth[stage] = t.boosted;
@@ -2897,9 +2952,8 @@ void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t
         constexpr float kSunSlope = -1.5f;
         k.sun = 1;
         k.zen = 1;
-        // what is blended in with no alpha test is see-through all over (glass, water, a mark laid on the ground): it
-        // is in the picture's alpha as before but holds no depth, so it casts nothing a depth test would make solid
-        k.zwrite = !(k.blend && !SimpleState(s, kMAlphaTestEnable));
+        k.zwrite = 1;
+        k.blend = k.src = k.dst = k.op = k.wmask = 0;  // no colour: one pipeline whatever the title blends by
         k.zfunc = kLessEqual;
         k.sten = 0;
         k.zbias = kSunBias;
@@ -3535,6 +3589,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     if (CurrentFrame().used > kUploadSize - kUploadReserve) Submit(true);
     if (!BindTargets(s)) return;
     if (ext_ && ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed) && !BindTargets(s)) return;
+    // Into the shadow picture's depth. What is blended in with no alpha test is see-through all over (glass, water, a
+    // mark laid on the ground): it casts nothing a depth test would make solid, and is not drawn.
+    bool into_sun = bound_ds_ && bound_ds_->sun;
+    if (into_sun && SimpleState(s, kMBlendEnable) && !SimpleState(s, kMAlphaTestEnable)) return;
 
     // vertex shader
     DrawShaders sh = ClassifyShaders(s, a, count);
@@ -3547,13 +3605,18 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     if (!BindStageTexturesAndTargets(s, stages)) return;
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;
-    sh.pkey = Hash(&pk, sizeof(pk));
-    EnsurePixelShader(pk, sh);
-    if (!sh.ps_code && !sun_failed_ && std::any_of(std::begin(pk.tex), std::end(pk.tex), [](const TexInfo& t) { return t.flags & kTexSun; })) {
+    // and there a pixel shader is run only where it can leave a pixel out (a fence's or a tree's cut-out): the rest
+    // is depth alone, from the vertex shader
+    bool depth_only = bound_ds_ && bound_ds_->sun && !bound_rt_ && !Discards(pk);
+    if (!depth_only) {
+        sh.pkey = Hash(&pk, sizeof(pk));
+        EnsurePixelShader(pk, sh);
+    }
+    if (!depth_only && !sh.ps_code && !sun_failed_ && std::any_of(std::begin(pk.tex), std::end(pk.tex), [](const TexInfo& t) { return t.flags & kTexSun; })) {
         sun_failed_ = true;  // from the next draw the picture's alpha, as before
         LOGE("d3d12: the shadow picture's depth test did not compile: its shadows are its silhouettes");
     }
-    if (!sh.vs_code || !sh.ps_code) return;
+    if (!sh.vs_code || (!sh.ps_code && !depth_only)) return;
 
     // pipeline
     PsoKey k;
@@ -3567,7 +3630,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     // constants
     GuestExtent size;
-    SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
+    SurfaceSize(bound_rt_ || into_sun ? s.rt : s.zs, size.w, size.h);
     DrawConstants c{};
     UploadConstants(s, sh, k, stages, size, c);
     if (ext_) binds_ = {};
@@ -3575,7 +3638,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     if (cap_) {
         CaptureDraw(s, prim, count, k, c, stages);
         EndDrawCapture(s, a, count, c);
-        CaptureShaders(s, a, sh, pk);
+        if (!depth_only) CaptureShaders(s, a, sh, pk);
     }
 
     // texture views and samplers, viewport and scissor, blend factor and stencil reference
@@ -3701,7 +3764,7 @@ void D3D12Backend::Occlusion(const State& s, const float p[4 * kOcclusionRects])
     if (!depth) return;
     // the shadow picture's depth, drawn this frame (d3d::SunShadows), and where this view lies in it
     // (d3d::SunOcclusion): the shade is lighter in the sun
-    Target* sun = sun_view_on_ && sun_on_ && !sun_failed_ && !sun_shade_failed_ ? sun_last_ : nullptr;
+    Target* sun = sun_view_on_ && sun_on_ && sun_begun_ && !sun_failed_ && !sun_shade_failed_ ? &sun_w_ : nullptr;
     sun_view_on_ = false;  // for this view only (the gun's scene is shaded after it)
     if (sun) {
         std::memcpy(c + 24, sun_view_, 12 * sizeof(float));
@@ -3883,8 +3946,13 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
     }
     if (flags & kClearSun) {
         if (count == kSunRects && rects) {
-            std::memcpy(sun_, rects, sizeof(sun_));
+            float p[4 * kSunRects];
+            std::memcpy(p, rects, sizeof(p));
+            std::memcpy(sun_, p, sizeof(sun_));
+            sun_keep_ = int(p[20]);
+            sun_id_ = int(p[21]);
             sun_on_ = true;
+            sun_begun_ = false;
         }
         return;
     }
@@ -3911,18 +3979,10 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
     SurfaceSize(rt ? s.rt : s.zs, gw, gh);
     std::vector<D3D12_RECT> rs;
     ClearArgs c{.count = count, .rects = rects, .flags = flags, .color = color, .z = z, .stencil = stencil};
+    // the shadow picture while its depth is kept: that is started in the colour's place (SunBegin), which is not drawn
+    if (rt && SunDepth(*rt, true)) rt = nullptr;
     for (Target* t : {rt, ds}) {
         if (t) ClearTarget(*t, s, c, rs);
-    }
-    // the shadow picture's depth goes with its colour
-    Target* sd = rt ? SunDepth(*rt) : nullptr;
-    if (sd) {
-        ClearArgs depth = c;
-        depth.flags = kClearZ;
-        depth.z = 1;  // the far end, kDepthFar as it is stored
-        ClearTarget(*sd, s, depth, rs);
-        sun_drawn_ = true;
-        sun_last_ = sd;
     }
 }
 
@@ -4492,8 +4552,7 @@ void D3D12Backend::Present(const Surface& front) {
         LOGR("d3d12: shadows from the picture's depth");
     }
     g_sun_depth_ok.store(sun_works_ && !sun_failed_, std::memory_order_relaxed);
-    sun_on_ = sun_drawn_ = sun_view_on_ = false;
-    sun_last_ = nullptr;
+    sun_on_ = sun_drawn_ = sun_view_on_ = sun_begun_ = false;
     dof_draws_ = 0;
     dof_stage_ = 0;
     if (ramp_dirty_) UploadGammaRamp();
@@ -4552,9 +4611,7 @@ void D3D12Backend::ApplySettings() {
         Flush();
         for (auto& [key, tg] : targets_) (tg.depth ? free_dsv_ : free_rtv_).push_back(tg.view);
         targets_.clear();
-        for (auto& [rt, d] : sun_ds_) free_dsv_.push_back(d.view);
-        sun_ds_.clear();
-        sun_last_ = nullptr;
+        DropSunDepth();
         scale_ = want;
         if (msaa != msaa_set_) {
             msaa_set_ = msaa;

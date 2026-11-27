@@ -506,47 +506,61 @@ void alphatest(float a) {
 }
 )";
 
-const char* kPsSun = R"(// The shadow picture read by its depth (kTexSun, d3d::SunShadows): p the stage's coordinates over their w, uv where
-// they read the picture. A point is in shadow where the picture holds something nearer its camera: its own depth is
-// sun[0] . (p, 1), 0 at the picture's near plane and 1 at its far one, and the picture holds 1 less that (depth is
-// stored reversed). 3 x 3 gathers 2 texels apart, a box 6 texels across, each texel tested along the receiver's
-// own plane (its slope in depth per uv from the screen derivatives, at most sun[1].w) less the bias sun[1].z.
+const char* kPsSun = R"(// The shadow picture read by its depth (kTexSun, d3d::SunShadows): p the stage's coordinates over their w, at where
+// they read the picture. The picture's u and v are sun[2] . (p, 1) and sun[3] . (p, 1): the stage's own, but in a frame
+// that reads the picture another camera left (d3d::kSunStill) that picture's. A point is in shadow where the picture
+// holds something nearer its camera: its own depth is sun[0] . (p, 1), 0 at the picture's near plane and 1 at its far
+// one, and the picture holds 1 less that (depth is stored reversed). A box 3 texels across laid just where the point
+// is: 4 gathers, 16 texels, the outer ones weighed by how much of them the box covers (so the shadow's edge moves
+// evenly with the point, no step from texel to texel), each gather tested along the receiver's own plane (its slope
+// in depth per uv from the screen derivatives, at most sun[1].w) less the bias sun[1].z.
 // light: the surface's baked light (kTexSunLight), darkened only down to the shade sun[1].y. Handed on as the
 // silhouette picture's alpha (black, alpha the shadow) times sun[1].x.
-// Only in the shaders that read it (PixelHlsl), with its two constants at the end of the draw's: every other shader's
+// Only in the shaders that read it (PixelHlsl), with its constants at the end of the draw's: every other shader's
 // text, and so its place in the cache of compiled ones, is as it was.
-float4 sunshadow(Texture2D t, SamplerState s, float3 p, float2 uv, float4 light) {
-    float z = dot(float4(p, 1), sun[0]);
+
+// kx, ky: the weights of a gather's left and right columns, of its upper and lower rows (v grows downwards)
+float sunopen(Texture2D t, SamplerState s, float2 at, float limit, float2 kx, float2 ky) {
+    float4 g = t.GatherRed(s, at);  // left lower, right lower, right upper, left upper
+    return dot(step(g, limit), float4(kx.x * ky.y, kx.y * ky.y, kx.y * ky.x, kx.x * ky.x));
+}
+float4 sunshadow(Texture2D t, SamplerState s, float3 p, float2 at, float4 light) {
+    float4 q = float4(p, 1);
+    float z = dot(q, sun[0]);
+    float2 uv = float2(dot(q, sun[2]), dot(q, sun[3])) + (at - p.xy);
     float2 ux = ddx(uv), uy = ddy(uv);
     float zx = ddx(z), zy = ddy(z);
     if (any(uv <= 0) || any(uv >= 1) || !(z > 0 && z < 1)) return float4(0, 0, 0, 0);
     float w, h;
     t.GetDimensions(w, h);
-    float2 texel = 1 / float2(w, h);
+    float2 size = float2(w, h), texel = 1 / size;
     float det = ux.x * uy.y - ux.y * uy.x;
     float2 slope = float2(0, 0);
     if (abs(det) > 1e-24) slope = float2(uy.y * zx - ux.y * zy, ux.x * zy - uy.x * zx) / det;
     slope = clamp(slope, -sun[1].w, sun[1].w);
     // reversed: lit where the picture holds no more than 1 - (z - bias), a texel's slope taken off for its rounding
     float limit = 1 - z + sun[1].z + dot(abs(slope), texel);
-    float open = 0;
-    [unroll] for (int y = -1; y <= 1; y++) {
-        [unroll] for (int x = -1; x <= 1; x++) {
-            float2 o = float2(x, y) * 2 * texel;
-            float4 g = t.GatherRed(s, uv + o);
-            open += dot(step(g, limit - dot(slope, o)), float4(1, 1, 1, 1));
-        }
-    }
-    // nothing at the picture's edges and far end, coming in over a twentieth of it: no line where it stops
-    float2 e = min(uv, 1 - uv);
-    float dark = (1 - open / 36) * saturate(min(min(e.x, e.y), 1 - z) * 20);
+    // the texel the box's middle is in or just past is corner; the box covers corner - 1 to corner + 2, the first by
+    // 1 - part and the last by part. A gather at a texel's corner takes the four texels that meet there.
+    float2 first = uv * size - 0.5, corner = floor(first), part = first - corner;
+    float4 kx = float4(1 - part.x, 1, 1, part.x), ky = float4(1 - part.y, 1, 1, part.y);
+    float2 a = corner * texel, b = a + 2 * texel;
+    float open = sunopen(t, s, a, limit - dot(slope, a - uv), kx.xy, ky.xy);
+    open += sunopen(t, s, float2(b.x, a.y), limit - dot(slope, float2(b.x, a.y) - uv), kx.zw, ky.xy);
+    open += sunopen(t, s, float2(a.x, b.y), limit - dot(slope, float2(a.x, b.y) - uv), kx.xy, ky.zw);
+    open += sunopen(t, s, b, limit - dot(slope, b - uv), kx.zw, ky.zw);
+    // nothing at the edges of the square the shadows end at (sun[4]: where it lies from the picture's own, how far
+    // inside) and at the picture's far end, coming in over a twentieth of it: no line where it stops
+    float2 e = uv + sun[4].xy;
+    e = min(e, 1 - e) - sun[4].z;
+    float dark = (1 - open / 9) * saturate(min(min(e.x, e.y), 1 - z) * 20);
     if (sun[1].y > 0) dark *= saturate(1 - sun[1].y / max(dot(light.rgb, float3(1, 1, 1)) / 3, 1e-3));
     return float4(0, 0, 0, dark * sun[1].x);
 }
 )";
 // kCommonTail's end, and the same with sunshadow's constants (DrawConstants::sun)
 const char* kConstantsEnd = "    float4 zparams;\n};\n";
-const char* kConstantsEndSun = "    float4 zparams;\n    float4 sun[2];\n};\n";
+const char* kConstantsEndSun = "    float4 zparams;\n    float4 sun[5];\n};\n";
 
 std::string PsHelpers() { return kPsSbyte + Hooks().Shadow() + kPsTail; }
 
@@ -921,6 +935,14 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
 }
 )";
     return s;
+}
+
+bool Discards(const PixelKey& k) {
+    if (k.alphatest || k.alphakill) return true;
+    for (int i = 0; k.programmable && i < 4; i++) {
+        if (((k.tex_modes >> (i * 5)) & 0x1F) == 5) return true;  // PS_TEXTUREMODES clipplane
+    }
+    return false;
 }
 
 std::string PixelHlsl(const PixelKey& k) {
