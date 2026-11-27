@@ -1211,6 +1211,35 @@ float4 MirrorFind(float3 P, float3 R, float3 N, float z) {
     }
     return float4(col, show);
 }
+// A water drawn whole: how near something rises through the surface round P (a shore, a hull, a post), 1 at it to 0
+// from kFoam units out. Points of the surface round P, in three rings: what the last frame's picture holds over each
+// is such a thing where it lies a little above the surface's level (a beach rises a unit in a ring's width; no more
+// than the ring is wide: a bridge over the water is not in it) and near the point itself (what stands before the
+// water, nearer the eye, is not).
+static const float kFoam = 64;
+float MirrorShore(float3 P, float3 N) {
+    float3 Pl = float3(dot(P, mirror[4].xyz) + mirror[4].w, dot(P, mirror[5].xyz) + mirror[5].w, dot(P, mirror[6].xyz) + mirror[6].w);
+    float3 Nl = float3(dot(N, mirror[4].xyz), dot(N, mirror[5].xyz), dot(N, mirror[6].xyz));
+    float3 Xl = float3(dot(mirror[8].xyz, mirror[4].xyz), dot(mirror[8].xyz, mirror[5].xyz), dot(mirror[8].xyz, mirror[6].xyz));
+    float3 Yl = float3(dot(mirror[9].xyz, mirror[4].xyz), dot(mirror[9].xyz, mirror[5].xyz), dot(mirror[9].xyz, mirror[6].xyz));
+    float near = 0;
+    for (int r = 1; r <= 3; r++) {
+        float d = r * (kFoam / 3.0);
+        for (int k = 0; k < 6; k++) {
+            float turn = k * 1.0471976 + r * 0.35;
+            float3 q = Pl + (Xl * cos(turn) + Yl * sin(turn)) * d;
+            float2 px = MirrorPixel(float3(q.xy, max(q.z, 1)));
+            if (q.z > 1 && MirrorInside(px)) {
+                float3 held = MirrorPlace(px, MirrorDepth(px));
+                float over = dot(held - Pl, Nl);
+                if (over > 0.4 + 0.003 * q.z && over < d + 4 && length(held - q) < 1.5 * d + 4 + 0.005 * q.z) {
+                    near = max(near, (4 - r) / 3.0);
+                }
+            }
+        }
+    }
+    return near;
+}
 float4 main(VOut i) : SV_Target {
     float4 vp = mirror[10];
     float2 ndc = (i.pos.xy - vp.xy) / vp.zw * float2(2, -2) + float2(-1, 1);
@@ -1263,6 +1292,13 @@ float4 main(VOut i) : SV_Target {
     float3 c = body * (1 - fresnel) + seen * min(fresnel, 0.85);
     // the sun's glint, where the mirrored line goes to it
     c += float3(1.0, 0.97, 0.9) * (pow(saturate(dot(R, mirror[13].xyz)), 260) * mirror[12].w);
+    // foam where a shore or a hull rises through it: whole at the edge, in patches by the waves further out; none
+    // where the rings round a pixel are finer than the pixels
+    if (mirror[3].z > 0.5) {
+        float shore = MirrorShore(P, N) * saturate(2 - foot * 6 / kFoam);
+        float foam = saturate(shore * 1.3 - 0.45 + crest * 2.5);
+        c = lerp(c, saturate(mirror[12].rgb * 1.5 + 0.1), foam * 0.9);
+    }
     // far off, where its waves are finer than the pixels, the title's own surface is left to show; and in the fog
     return float4(c, (1 - saturate((z - 5000) / 9000)) * saturate(i.fogamt));
 }
