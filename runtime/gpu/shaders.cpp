@@ -1106,6 +1106,10 @@ namespace {
 //   to the last frame's: x, y and z, each a dot with (position, 1)
 //   [7] the surface's up in view space    [8] [9] the world's two level axes: xyz their directions in view space,
 //   and with w the dot with (position, 1) is the place along each           [10] the scene's viewport in target pixels
+//   [3] z: 1 when the last frame's picture can be read
+//   [11] the water's own colour, w 0 for the mirror laid over the title's surface, or how rough a water drawn whole is
+//   [12] the sky's colour where the picture has nothing to mirror, w how bright the sun glints
+//   [13] the way to the sun in view space
 const char* kMirror = R"(
 Texture2D last : register(t0);
 Texture2D<float> lastz : register(t1);
@@ -1114,6 +1118,21 @@ static const float4 kWave[6] = {
     float4(0.9553, 0.2955, 0.02978, 0.09), float4(0.4536, 0.8912, 0.04161, 0.08), float4(-0.4161, 0.9093, 0.06478, 0.08),
     float4(-0.9041, 0.4274, 0.10300, 0.07), float4(-0.6536, -0.7568, 0.16982, 0.06), float4(0.4685, -0.8835, 0.27318, 0.05)};
 static const float2 kTurn[6] = {float2(0.3, 21), float2(1.7, 24), float2(4.1, 31), float2(2.2, 39), float2(5.0, 49), float2(0.9, 63)};
+// a water drawn whole: its waves from a long swell to fine chop, most of them with the wind, in the same terms
+static const float4 kSea[22] = {
+    float4(0.6598, 0.7514, 0.00624, 0.0263), float4(0.9987, 0.0504, 0.00743, 0.0263), float4(0.9251, -0.3797, 0.01102, 0.0375),
+    float4(0.8598, 0.5106, 0.01284, 0.0375), float4(0.9940, 0.1095, 0.02061, 0.0450), float4(0.7603, 0.6496, 0.01765, 0.0450),
+    float4(0.6642, 0.7475, 0.02884, 0.0525), float4(0.9968, -0.0795, 0.03199, 0.0525), float4(0.9465, -0.3228, 0.05213, 0.0562),
+    float4(0.1360, 0.9907, 0.05041, 0.0562), float4(0.8289, 0.5595, 0.09064, 0.0562), float4(0.9999, -0.0152, 0.07921, 0.0562),
+    float4(0.9431, 0.3326, 0.15707, 0.0525), float4(0.9959, -0.0910, 0.14370, 0.0525), float4(0.8141, 0.5807, 0.19623, 0.0488),
+    float4(0.4682, 0.8836, 0.24692, 0.0488), float4(0.8165, 0.5774, 0.31408, 0.0450), float4(0.6993, 0.7148, 0.40225, 0.0450),
+    float4(0.9699, 0.2436, 0.63817, 0.0375), float4(0.9363, 0.3512, 0.49946, 0.0375), float4(0.6894, 0.7244, 0.86192, 0.0338),
+    float4(0.9952, -0.0983, 0.91396, 0.0338)};
+static const float2 kSeaTurn[22] = {
+    float2(4.87, 9), float2(5.49, 10), float2(5.01, 13), float2(1.75, 14), float2(3.17, 17), float2(4.98, 16),
+    float2(1.35, 20), float2(0.28, 21), float2(2.93, 27), float2(3.23, 27), float2(0.07, 36), float2(1.26, 34),
+    float2(5.21, 48), float2(5.53, 46), float2(4.02, 53), float2(3.40, 60), float2(2.27, 67), float2(2.43, 76),
+    float2(5.13, 96), float2(3.71, 85), float2(4.25, 111), float2(1.50, 115)};
 // the last frame's pixel a point of its view space falls on
 float2 MirrorPixel(float3 q) {
     float2 ndc = q.xy / (q.z * mirror[2].xy) + mirror[2].zw;
@@ -1151,27 +1170,9 @@ float MirrorEdge(float2 px) {
     float2 e = min(px - mirror[10].xy, mirror[10].xy + mirror[10].zw - px) / (0.08 * mirror[10].zw);
     return saturate(min(e.x, e.y));
 }
-float4 main(VOut i) : SV_Target {
-    float4 vp = mirror[10];
-    float2 ndc = (i.pos.xy - vp.xy) / vp.zw * float2(2, -2) + float2(-1, 1);
-    float z = mirror[1].x / (mirror[1].y - i.pos.z);
-    float3 P = float3((ndc - mirror[0].zw) * mirror[0].xy * z, z);
-    float3 V = normalize(P);
-    float3 N = mirror[7].xyz;
-    // ripples over the level plane, each fading where it is finer than the pixels that show it
-    float2 place = float2(dot(P, mirror[8].xyz) + mirror[8].w, dot(P, mirror[9].xyz) + mirror[9].w);
-    float foot = z * mirror[0].x * 2 / vp.z / max(abs(dot(V, N)), 0.02);
-    float2 slope = float2(0, 0);
-    for (int k = 0; k < 6; k++) {
-        float len = 6.2831853 / kWave[k].z;
-        float a = kWave[k].w * saturate(len / (foot * 3) - 0.5);
-        slope += kWave[k].xy * (cos(dot(place, kWave[k].xy) * kWave[k].z + kTurn[k].x - mirror[1].w * kTurn[k].y * 0.09817477) * a);
-    }
-    float3 n = normalize(N - slope.x * mirror[8].xyz - slope.y * mirror[9].xyz);
-    float3 R = reflect(V, n);
-    // a line that would go under the surface is laid along it
-    float rise = dot(R, N);
-    if (rise < 0.02) R = normalize(R - (rise - 0.02) * N);
+// What the surface at P (up N, view z) mirrors along R, from the last frame's picture: its colour, and in w how
+// much of it the picture gives (0 where it holds nothing for that line).
+float4 MirrorFind(float3 P, float3 R, float3 N, float z) {
     // along it through the last frame's picture: steps that grow, the first of them that lies just behind what the
     // picture holds there is what the surface mirrors. Not the surface itself: seen flat, a pixel of it spans many
     // units of depth and a step along the line is soon behind the one depth the picture has for it. What lies in the
@@ -1208,10 +1209,62 @@ float4 main(VOut i) : SV_Target {
             show = MirrorEdge(px);
         }
     }
-    // more of the mirror the flatter the surface is seen, never all of it; none of it in the fog
+    return float4(col, show);
+}
+float4 main(VOut i) : SV_Target {
+    float4 vp = mirror[10];
+    float2 ndc = (i.pos.xy - vp.xy) / vp.zw * float2(2, -2) + float2(-1, 1);
+    float z = mirror[1].x / (mirror[1].y - i.pos.z);
+    float3 P = float3((ndc - mirror[0].zw) * mirror[0].xy * z, z);
+    float3 V = normalize(P);
+    float3 N = mirror[7].xyz;
+    // ripples over the level plane, each fading where it is finer than the pixels that show it
+    float2 place = float2(dot(P, mirror[8].xyz) + mirror[8].w, dot(P, mirror[9].xyz) + mirror[9].w);
+    float foot = z * mirror[0].x * 2 / vp.z / max(abs(dot(V, N)), 0.02);
+    float2 slope = float2(0, 0);
+    float sea = mirror[11].w;
+    float crest = 0;
+    if (sea > 0) {
+        for (int j = 0; j < 22; j++) {
+            float len = 6.2831853 / kSea[j].z;
+            float a = kSea[j].w * sea * saturate(len / (foot * 3) - 0.5);
+            float arg = dot(place, kSea[j].xy) * kSea[j].z + kSeaTurn[j].x - mirror[1].w * kSeaTurn[j].y * 0.09817477;
+            slope += kSea[j].xy * (cos(arg) * a);
+            crest += sin(arg) * a;
+        }
+    } else {
+        for (int k = 0; k < 6; k++) {
+            float len = 6.2831853 / kWave[k].z;
+            float a = kWave[k].w * saturate(len / (foot * 3) - 0.5);
+            slope += kWave[k].xy * (cos(dot(place, kWave[k].xy) * kWave[k].z + kTurn[k].x - mirror[1].w * kTurn[k].y * 0.09817477) * a);
+        }
+    }
+    float3 n = normalize(N - slope.x * mirror[8].xyz - slope.y * mirror[9].xyz);
+    float3 R = reflect(V, n);
+    // a line that would go under the surface is laid along it
+    float rise = dot(R, N);
+    if (rise < 0.02) R = normalize(R - (rise - 0.02) * N);
+    float4 found = float4(0, 0, 0, 0);
+    if (mirror[3].z > 0.5) found = MirrorFind(P, R, N, z);
+    // more of the mirror the flatter the surface is seen
     float facing = saturate(-dot(V, n));
     float fresnel = 0.02 + 0.98 * pow(1 - facing, 5);
-    return float4(col, min(fresnel, 0.6) * mirror[1].z * show * saturate(i.fogamt));
+    // laid over the title's surface: never all of it, and none of it in the fog
+    if (sea <= 0) return float4(found.rgb, min(fresnel, 0.6) * mirror[1].z * found.w * saturate(i.fogamt));
+    // The water whole. Looked down into it is its own colour darkened, a little to the green and blue; a crest that
+    // faces the eye lets some light back through; the rest is the mirror, the sky's colour where the picture has
+    // nothing for it.
+    float3 tone = mirror[11].rgb * saturate(i.d0.rgb);
+    float3 deep = tone * float3(0.42, 0.50, 0.52);
+    float3 scatter = tone * float3(0.75, 0.95, 0.90);
+    float light = saturate(crest * 2.2 + 0.15) * saturate(1 - facing * 1.5);
+    float3 body = deep + (scatter - deep) * (light * 0.5);
+    float3 seen = lerp(mirror[12].rgb, found.rgb, found.w);
+    float3 c = body * (1 - fresnel) + seen * min(fresnel, 0.85);
+    // the sun's glint, where the mirrored line goes to it
+    c += float3(1.0, 0.97, 0.9) * (pow(saturate(dot(R, mirror[13].xyz)), 260) * mirror[12].w);
+    // far off, where its waves are finer than the pixels, the title's own surface is left to show; and in the fog
+    return float4(c, (1 - saturate((z - 5000) / 9000)) * saturate(i.fogamt));
 }
 )";
 }  // namespace
@@ -1220,7 +1273,7 @@ std::string MirrorHlsl() {
     std::string s = Common();
     size_t end = s.rfind(kConstantsEnd);
     if (end != std::string::npos) {
-        s.replace(end, std::strlen(kConstantsEnd), "    float4 zparams;\n    float4 sun[5];\n    float4 mirror[11];\n};\n");
+        s.replace(end, std::strlen(kConstantsEnd), "    float4 zparams;\n    float4 sun[5];\n    float4 mirror[14];\n};\n");
     }
     return s + kMirror;
 }

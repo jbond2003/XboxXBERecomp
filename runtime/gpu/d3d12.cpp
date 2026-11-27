@@ -1227,7 +1227,8 @@ private:
     };
     MirrorView mirror_v_[2];
     bool mirror_ok_ = false;             // this frame's mirroring draws get their second draw (set with placed)
-    float mirror_[11][4] = {};           // DrawConstants::mirror
+    bool mirror_read_ = false;           // and it reads the last frame's copies (a water drawn whole may go without)
+    float mirror_[14][4] = {};           // DrawConstants::mirror
     uint64_t mirror_seen_ = UINT64_MAX;  // presents_ of the last frame with a mirroring draw
     // single sample copies of the scene's colour and depth as the last frame's world left them, made while mirroring
     // draws are about
@@ -3716,7 +3717,8 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 // A mirroring draw of the frame's scene (stage 0's texture marked, bound_rt_ and bound_ds_ its targets): whether it
 // gets its second draw. The frame's first such draw says where the view lies in the target (the title's Reflections
 // call comes before the scene has set its viewport) and fills the constants; the answer holds for the frame.
-// It takes the last frame's view, the copies made of that frame and the same viewport in both.
+// It takes the last frame's view, the copies made of that frame and the same viewport in both; a water drawn whole
+// (d3d::Water) is drawn without them too, with the sky's colour for its mirror.
 bool D3D12Backend::MirrorReady(const State& s) {
     MirrorView& now = mirror_v_[0];
     if (now.sent != presents_ || mirror_failed_ || ext_) return false;
@@ -3743,7 +3745,9 @@ bool D3D12Backend::MirrorReady(const State& s) {
     bool last = was.placed && was.sent + 1 == presents_ && !std::memcmp(was.vp, now.vp, sizeof(now.vp));
     bool copies = mirror_c_ && mirror_z_ && mirror_kept_ + 1 == presents_ && mirror_w_ == rt->w && mirror_h_ == rt->h &&
                   mirror_fmt_ == rt->fmt;
-    if (!last || !copies) return false;
+    bool whole = p[23] > 0;
+    mirror_read_ = last && copies;
+    if (!mirror_read_ && !whole) return false;
     if (!mirror_ps_) {
         mirror_ps_ = Compile(MirrorHlsl(), "main", "ps_5_0", mirror_ph_);
         if (!mirror_ps_) {
@@ -3751,17 +3755,20 @@ bool D3D12Backend::MirrorReady(const State& s) {
             LOGE("d3d12: the reflections' shader did not compile: surfaces are drawn without");
             return false;
         }
-        LOGR("d3d12: reflections on, from the last frame's picture, %ux%u", rt->w, rt->h);
+        LOGR("d3d12: %s, from the last frame's picture, %ux%u", whole ? "new water on, its mirror" : "reflections on",
+             rt->w, rt->h);
     }
-    // the view matrices' rows (the world's axes in view space) and places
+    // the view matrices' rows (the world's axes in view space) and places; with no last frame to read, this one's
+    // stands in its place and the shader is told not to read
+    const MirrorView& from = mirror_read_ ? was : now;
     const float* a = p + 8;
-    const float* b = was.p + 8;
+    const float* b = from.p + 8;
     const float* t = p + 17;
-    const float* u = was.p + 17;
+    const float* u = from.p + 17;
     float (*m)[4] = mirror_;
-    for (int i = 0; i < 4; i++) m[0][i] = p[i], m[2][i] = was.p[i];
+    for (int i = 0; i < 4; i++) m[0][i] = p[i], m[2][i] = from.p[i];
     m[1][0] = now.zp[0], m[1][1] = now.zp[1], m[1][2] = p[6], m[1][3] = p[7];
-    m[3][0] = was.zp[0], m[3][1] = was.zp[1], m[3][2] = m[3][3] = 0;
+    m[3][0] = from.zp[0], m[3][1] = from.zp[1], m[3][2] = mirror_read_ ? 1.0f : 0.0f, m[3][3] = 0;
     // this view to the world (the rotation's transpose), the world to the last view
     for (int j = 0; j < 3; j++) {
         float place = u[j];
@@ -3783,12 +3790,17 @@ bool D3D12Backend::MirrorReady(const State& s) {
         m[8 + r][3] = place;
     }
     std::memcpy(m[10], now.vp, sizeof(now.vp));
+    // the water drawn whole: its colour and how rough, the sky and the glint, the way to the sun in view space
+    for (int c = 0; c < 4; c++) m[11][c] = p[20 + c], m[12][c] = p[24 + c];
+    for (int c = 0; c < 3; c++) m[13][c] = p[28] * a[c] + p[29] * a[3 + c] + p[30] * a[6 + c];
+    m[13][3] = 0;
     mirror_ok_ = true;
     return true;
 }
 
 // The draw just made, again: the same geometry and vertex shader, the mirror's pixel shader blended over it by its
-// alpha where the surface is the nearest thing (its own depth, drawn a moment ago, passes), writing no depth.
+// alpha where the surface is the nearest thing (its own depth, drawn a moment ago, passes), writing no depth. A water
+// drawn whole is the same draw: its alpha is 1 but far off and in the fog.
 void D3D12Backend::DrawMirror(const Assembled& a, const DrawShaders& sh, const PsoKey& k) {
     constexpr uint32_t kSrcAlpha = 0x302, kInvSrcAlpha = 0x303, kAdd = 0x8006;  // as the title's states hold them
     constexpr uint32_t kLessEqual = 0x203;
@@ -3813,9 +3825,12 @@ void D3D12Backend::DrawMirror(const Assembled& a, const DrawShaders& sh, const P
         from.sv[i].Texture2D.MipLevels = 1;
         from.res[i] = nullptr;
     }
-    from.res[0] = mirror_c_.Get();
-    from.sv[0].Format = mirror_fmt_;
-    from.res[1] = mirror_z_.Get();
+    // (not read: nothing behind the views, the shader loads none of them)
+    if (mirror_read_) {
+        from.res[0] = mirror_c_.Get();
+        from.sv[0].Format = mirror_fmt_;
+        from.res[1] = mirror_z_.Get();
+    }
     from.sv[1].Format = kDepthRead;
     uint32_t views = EnsureViewSet(from);
     cl_->SetPipelineState(pso);

@@ -1570,8 +1570,9 @@ void SunShadows(const SunPicture& s) {
     g_backend->Clear(g_state, gpu::kSunRects, reinterpret_cast<const uint8_t*>(p), gpu::kClearSun, 0, 0, 0);
 }
 // sent as p: 1 / the projection's x and y scale, its x and y centre, then view z = p[4] / (depth - p[5]), the
-// strength, the clock, then the view matrix's three rows of three and its place
-void Reflections(const float* m, const float* view, float strength, float seconds) {
+// strength, the clock, then the view matrix's three rows of three and its place; from p[20] the water drawn whole:
+// its colour and how rough (0: none), the sky's colour and the glint, the way to the sun
+void Reflections(const float* m, const float* view, float strength, float seconds, const Water* water) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     bool perspective = m[11] == 1.0f && m[15] == 0.0f;
     if (!g_backend || !perspective || !m[0] || !m[5] || !(strength > 0)) return;
@@ -1579,6 +1580,11 @@ void Reflections(const float* m, const float* view, float strength, float second
     float p[4 * gpu::kMirrorRects] = {1 / m[0], 1 / m[5], m[8], m[9], m[14], m[10], strength, seconds};
     for (int r = 0; r < 4; r++) {
         for (int c = 0; c < 3; c++) p[8 + r * 3 + c] = view[r * 4 + c];
+    }
+    if (water && water->rough > 0) {
+        for (int c = 0; c < 3; c++) p[20 + c] = water->tone[c], p[24 + c] = water->sky[c], p[28 + c] = water->sun[c];
+        p[23] = water->rough;
+        p[27] = water->glint;
     }
     g_backend->Clear(g_state, gpu::kMirrorRects, reinterpret_cast<const uint8_t*>(p), gpu::kClearMirror, 0, 0, 0);
 }

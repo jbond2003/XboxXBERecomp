@@ -65,6 +65,17 @@ void SunOcclusion(const float view_to_sun[12], float keep, float bias);
 // vectors (a rotation and a place, the world's up its third row); strength: 1 as worked out, less for less of the
 // mirror; seconds: a clock for the ripples, counted round 64.
 // The first frame, and one whose view the last frame's picture cannot serve, is drawn without.
-void Reflections(const float* m, const float* view, float strength, float seconds);
+// water: those surfaces are water drawn whole instead. The second draw covers the title's own with a water of the
+// renderer's: waves that move, its own colour darker where it is looked down into, the mirror, the sky's colour where
+// the picture has nothing to mirror, and the sun's glint. Far off (from 5000 units, all of it at 14000) and in the
+// fog the title's surface is left to show. A frame without the last one's picture is drawn with the sky's colour.
+struct Water {
+    float tone[3];   // the water's own colour: what the title's picture of it averages
+    float rough;     // how rough: 1 a sea, less for stiller water (above 0)
+    float sky[3];    // the sky's colour
+    float glint;     // how bright the sun glints in it, 0 for none
+    float sun[3];    // the way to the sun in the world, a unit vector
+};
+void Reflections(const float* m, const float* view, float strength, float seconds, const Water* water = nullptr);
 
 }  // namespace d3d
