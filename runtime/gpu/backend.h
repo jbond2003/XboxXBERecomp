@@ -23,12 +23,15 @@ enum : uint32_t {
     // Not a D3DCLEAR value: where the next d3d::Occlusion's view lies in the shadow picture (d3d::SunOcclusion),
     // kSunViewRects of floats
     kClearSunView = 0x400,
+    // Not a D3DCLEAR value: this frame's view for the surfaces that mirror (d3d::Reflections), kMirrorRects of floats
+    kClearMirror = 0x800,
 };
 constexpr uint32_t kOcclusionRects = 4;
 constexpr uint32_t kSunRects = 6;
 // what a frame's draws into the shadow picture are (d3d::SunPicture::keep)
 enum SunKeep : int { kSunWhole = 0, kSunMoving = 1, kSunStill = 2 };
 constexpr uint32_t kSunViewRects = 4;
+constexpr uint32_t kMirrorRects = 5;
 
 class Backend {
 public:

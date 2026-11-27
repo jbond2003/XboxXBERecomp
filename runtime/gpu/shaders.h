@@ -68,6 +68,10 @@ bool Discards(const State& s);
 std::string QuadHlsl(std::string s);
 // depth stored reversed (1 at the near clip, 0 at the far one) from DrawConstants::zparams, for a vertex shader
 std::string ReversedDepthHlsl(std::string s);
+// The pixel shader of a second draw over a surface that mirrors (d3d::Reflections), for any vertex shader made here:
+// what the last frame's picture holds along each pixel's mirrored line of sight, its alpha how much of it shows.
+// t0 the last frame's colour, t1 its depth as the renderer stores it (reversed), both read with Load.
+std::string MirrorHlsl();
 // the geometry shader that draws a point as its console pixel
 std::string PointHlsl();
 
@@ -114,6 +118,7 @@ struct DrawConstants {
     float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
     float zparams[4];    // ReversedDepthHlsl: a w buffer's scale (0 for a z buffer), its far w, the polygon offset
     float sun[5][4];     // kTexSun, d3d::SunShadows: from; gain, shade, bias, slope; across; up; fade
+    float mirror[11][4];  // MirrorHlsl, d3d::Reflections: as its comment lists them
 };
 
 }  // namespace gpu

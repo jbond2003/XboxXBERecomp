@@ -23,6 +23,12 @@ using Provider = std::shared_ptr<const Picture> (*)(const TextureDesc& d, const 
 
 void SetProvider(Provider p);  // before boot
 std::shared_ptr<const Picture> Find(const TextureDesc& d, const uint8_t* guest, float render_scale);
+// What a title says of a texture's bytes besides, asked when the provider is. kMirror: what is drawn with it on stage 0
+// is a level surface that mirrors, still water (d3d::Reflections).
+enum : uint8_t { kMirror = 1 };
+using Marker = uint8_t (*)(const TextureDesc& d, const uint8_t* guest);
+void SetMarker(Marker m);  // before boot
+uint8_t Marks(const TextureDesc& d, const uint8_t* guest);
 void Changed();      // any thread: what the provider gives has changed, every texture is asked again
 uint32_t Version();  // moves with Changed
 

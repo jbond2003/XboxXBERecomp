@@ -1098,6 +1098,133 @@ std::string ReversedDepthHlsl(std::string s) {
 }
 
 // a point covers its console pixel, several host pixels on an upscaled target: drawn as a quad of that size
+namespace {
+// DrawConstants::mirror, from the renderer:
+//   [0] this frame's projection: 1 / its x and y scale, its x and y centre      [1] view z = x / (y - depth), then how
+//   much of the mirror shows (1 as worked out) and the ripples' clock, seconds counted round 64
+//   [2] [3] the same two of the last frame's view                                [4] [5] [6] this frame's view space
+//   to the last frame's: x, y and z, each a dot with (position, 1)
+//   [7] the surface's up in view space    [8] [9] the world's two level axes: xyz their directions in view space,
+//   and with w the dot with (position, 1) is the place along each           [10] the scene's viewport in target pixels
+const char* kMirror = R"(
+Texture2D last : register(t0);
+Texture2D<float> lastz : register(t1);
+// ripples: direction, 2 pi / length, slope; phase, turns in 64 s
+static const float4 kWave[6] = {
+    float4(0.9553, 0.2955, 0.02978, 0.09), float4(0.4536, 0.8912, 0.04161, 0.08), float4(-0.4161, 0.9093, 0.06478, 0.08),
+    float4(-0.9041, 0.4274, 0.10300, 0.07), float4(-0.6536, -0.7568, 0.16982, 0.06), float4(0.4685, -0.8835, 0.27318, 0.05)};
+static const float2 kTurn[6] = {float2(0.3, 21), float2(1.7, 24), float2(4.1, 31), float2(2.2, 39), float2(5.0, 49), float2(0.9, 63)};
+// the last frame's pixel a point of its view space falls on
+float2 MirrorPixel(float3 q) {
+    float2 ndc = q.xy / (q.z * mirror[2].xy) + mirror[2].zw;
+    return (ndc * float2(0.5, -0.5) + 0.5) * mirror[10].zw + mirror[10].xy;
+}
+bool MirrorInside(float2 px) {
+    return px.x >= mirror[10].x && px.y >= mirror[10].y && px.x < mirror[10].x + mirror[10].z && px.y < mirror[10].y + mirror[10].w;
+}
+// the last frame's view z there
+float MirrorDepth(float2 px) {
+    int2 p = clamp(int2(px), int2(mirror[10].xy), int2(mirror[10].xy + mirror[10].zw) - 1);
+    return mirror[3].x / (mirror[3].y - lastz.Load(int3(p, 0)));
+}
+// where in its view space what it holds there lies, z its view z
+float3 MirrorPlace(float2 px, float z) {
+    float2 centre = floor(clamp(px, mirror[10].xy, mirror[10].xy + mirror[10].zw - 1)) + 0.5;
+    float2 ndc = (centre - mirror[10].xy) / mirror[10].zw * float2(2, -2) + float2(-1, 1);
+    return float3((ndc - mirror[2].zw) * mirror[2].xy * z, z);
+}
+// its colour there, between the four pixels around
+float3 MirrorColour(float2 px) {
+    float2 hi = mirror[10].xy + mirror[10].zw - 1;
+    float2 q = clamp(px - 0.5, mirror[10].xy, hi);
+    int2 a = int2(q);
+    int2 b = min(a + 1, int2(hi));
+    float2 f = q - a;
+    float3 c00 = last.Load(int3(a.x, a.y, 0)).rgb;
+    float3 c10 = last.Load(int3(b.x, a.y, 0)).rgb;
+    float3 c01 = last.Load(int3(a.x, b.y, 0)).rgb;
+    float3 c11 = last.Load(int3(b.x, b.y, 0)).rgb;
+    return lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
+}
+// 0 at the picture's edge, 1 from 8% in: what lies past the edge is not in the picture to be mirrored
+float MirrorEdge(float2 px) {
+    float2 e = min(px - mirror[10].xy, mirror[10].xy + mirror[10].zw - px) / (0.08 * mirror[10].zw);
+    return saturate(min(e.x, e.y));
+}
+float4 main(VOut i) : SV_Target {
+    float4 vp = mirror[10];
+    float2 ndc = (i.pos.xy - vp.xy) / vp.zw * float2(2, -2) + float2(-1, 1);
+    float z = mirror[1].x / (mirror[1].y - i.pos.z);
+    float3 P = float3((ndc - mirror[0].zw) * mirror[0].xy * z, z);
+    float3 V = normalize(P);
+    float3 N = mirror[7].xyz;
+    // ripples over the level plane, each fading where it is finer than the pixels that show it
+    float2 place = float2(dot(P, mirror[8].xyz) + mirror[8].w, dot(P, mirror[9].xyz) + mirror[9].w);
+    float foot = z * mirror[0].x * 2 / vp.z / max(abs(dot(V, N)), 0.02);
+    float2 slope = float2(0, 0);
+    for (int k = 0; k < 6; k++) {
+        float len = 6.2831853 / kWave[k].z;
+        float a = kWave[k].w * saturate(len / (foot * 3) - 0.5);
+        slope += kWave[k].xy * (cos(dot(place, kWave[k].xy) * kWave[k].z + kTurn[k].x - mirror[1].w * kTurn[k].y * 0.09817477) * a);
+    }
+    float3 n = normalize(N - slope.x * mirror[8].xyz - slope.y * mirror[9].xyz);
+    float3 R = reflect(V, n);
+    // a line that would go under the surface is laid along it
+    float rise = dot(R, N);
+    if (rise < 0.02) R = normalize(R - (rise - 0.02) * N);
+    // along it through the last frame's picture: steps that grow, the first of them that lies just behind what the
+    // picture holds there is what the surface mirrors. Not the surface itself: seen flat, a pixel of it spans many
+    // units of depth and a step along the line is soon behind the one depth the picture has for it. What lies in the
+    // surface's own level (within a hundredth of the way there, for a sheet that is not quite flat) is passed over.
+    float3 Pl = float3(dot(P, mirror[4].xyz) + mirror[4].w, dot(P, mirror[5].xyz) + mirror[5].w, dot(P, mirror[6].xyz) + mirror[6].w);
+    float3 Rl = float3(dot(R, mirror[4].xyz), dot(R, mirror[5].xyz), dot(R, mirror[6].xyz));
+    float3 Nl = float3(dot(N, mirror[4].xyz), dot(N, mirror[5].xyz), dot(N, mirror[6].xyz));
+    float reach = max(z * 2, 400);
+    float3 col = float3(0, 0, 0);
+    float show = 0;
+    float before = 0;
+    bool hit = false;
+    for (int s = 1; s <= 32; s++) {
+        float f = s / 32.0;
+        float t = reach * f * f;
+        float3 q = Pl + Rl * t;
+        float2 px = MirrorPixel(float3(q.xy, max(q.z, 1)));
+        if (!hit && q.z > 1 && MirrorInside(px)) {
+            float d = q.z - MirrorDepth(px);
+            float3 off = MirrorPlace(px, q.z - d) - Pl;
+            if (d > 0 && d < max((t - before) * 1.5, q.z * 0.03) && abs(dot(off, Nl)) > 1 + 0.01 * length(off)) {
+                hit = true;
+                col = MirrorColour(px);
+                show = MirrorEdge(px);
+            }
+        }
+        before = t;
+    }
+    // none: what lies far off the way the line goes (the sky, a far shore), where nothing nearer stands before it
+    if (!hit && Rl.z > 1e-4) {
+        float2 px = MirrorPixel(Rl);
+        if (MirrorInside(px) && MirrorDepth(px) > Pl.z + reach) {
+            col = MirrorColour(px);
+            show = MirrorEdge(px);
+        }
+    }
+    // more of the mirror the flatter the surface is seen, never all of it; none of it in the fog
+    float facing = saturate(-dot(V, n));
+    float fresnel = 0.02 + 0.98 * pow(1 - facing, 5);
+    return float4(col, min(fresnel, 0.6) * mirror[1].z * show * saturate(i.fogamt));
+}
+)";
+}  // namespace
+
+std::string MirrorHlsl() {
+    std::string s = Common();
+    size_t end = s.rfind(kConstantsEnd);
+    if (end != std::string::npos) {
+        s.replace(end, std::strlen(kConstantsEnd), "    float4 zparams;\n    float4 sun[5];\n    float4 mirror[11];\n};\n");
+    }
+    return s + kMirror;
+}
+
 std::string PointHlsl() {
     return Common() + R"(
 [maxvertexcount(4)]

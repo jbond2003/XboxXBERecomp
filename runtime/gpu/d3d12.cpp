@@ -720,6 +720,7 @@ struct Tex {
     const Tex* swap = nullptr;  // the texture pack's image drawn in its place
     uint64_t pack_key = 0;      // its pack image is still loading
     uint32_t pack_gen = 0;      // latch_gen_ the key was taken at, 0 after new bytes
+    uint8_t mark = 0;           // texture_override::Marks of its bytes, taken with the key
 };
 
 struct PsoKey {
@@ -785,6 +786,7 @@ struct DrawTextures {
     bool smooth[4] = {};        // a target made larger (g_boost): read between its texels whatever the title's filter
     float k[4] = {1, 1, 1, 1};  // Extension::Sample's k
     float wide[4] = {};         // host texels per console texel of a target read into a smaller one, 0 otherwise
+    bool mirror = false;        // stage 0's texture is one the title marked as mirroring (texture_override::kMirror)
 };
 
 // what the last draw set on the command list, so the next one sets only what differs; anything else that sets them
@@ -924,6 +926,10 @@ private:
     ID3D12PipelineState* EnsurePassPipeline(const char* hlsl, const char* vs_entry, const char* entry, DXGI_FORMAT rtv,
                                             float blend, uint32_t samples = 1);
     void DepthOfFieldStep(const State& s, uint32_t flags);
+    bool MirrorReady(const State& s);
+    void MirrorKeep(const State& s);
+    bool MirrorCopy(Target& t, ComPtr<ID3D12Resource>& copy, D3D12_RESOURCE_STATES& state);
+    void DrawMirror(const Assembled& a, const DrawShaders& sh, const PsoKey& k);
     void GunBlur(const State& s, float amount);
     void DepthOfField(const State& s, float amount);
     // Draw, in call order, each callee right after its caller
@@ -1210,6 +1216,30 @@ private:
     };
     std::vector<CapTex> cap_tex_;
     ComPtr<ID3D12Resource> lut_;
+    // Reflections (d3d::Reflections): a frame's view as the title sent it (p), with what a mirroring draw of the
+    // frame then told of it, the view z's two values and the viewport in target pixels; this frame's and the last's
+    struct MirrorView {
+        float p[4 * kMirrorRects] = {};
+        float zp[2] = {};
+        float vp[4] = {};
+        uint64_t sent = UINT64_MAX;  // presents_ it was sent in
+        bool placed = false;         // zp and vp are filled
+    };
+    MirrorView mirror_v_[2];
+    bool mirror_ok_ = false;             // this frame's mirroring draws get their second draw (set with placed)
+    float mirror_[11][4] = {};           // DrawConstants::mirror
+    uint64_t mirror_seen_ = UINT64_MAX;  // presents_ of the last frame with a mirroring draw
+    // single sample copies of the scene's colour and depth as the last frame's world left them, made while mirroring
+    // draws are about
+    ComPtr<ID3D12Resource> mirror_c_, mirror_z_;
+    D3D12_RESOURCE_STATES mirror_c_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+    D3D12_RESOURCE_STATES mirror_z_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+    uint32_t mirror_w_ = 0, mirror_h_ = 0;
+    DXGI_FORMAT mirror_fmt_ = DXGI_FORMAT_UNKNOWN;
+    uint64_t mirror_kept_ = UINT64_MAX;  // presents_ of the frame they are of
+    ID3DBlob* mirror_ps_ = nullptr;
+    uint64_t mirror_ph_ = 0;
+    bool mirror_failed_ = false;  // its shader did not compile, or no copies: no second draws
     // depth of field: draws with a depth buffer since the last clear of depth alone, and how far the frame has come
     // (0 the world not seen yet, 1 the world is done and the gun's scene is next, 2 nothing more this frame)
     uint32_t dof_draws_ = 0;
@@ -2619,6 +2649,7 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
     }
     if (tx.pack_gen != latch_gen_) LatchPackKey(tx, d, fi, colours);
     if (tx.pack_key) LatchPackImage(tx);
+    if (stage == 0 && (tx.mark & texture_override::kMirror)) stages.mirror = true;
     const Tex& drawn = tx.swap ? *tx.swap : tx;
     FillTextureView(drawn, d, stages.sv[stage]);
     if (fi.depth) info.shadow = ShadowDepthKind(d.format);
@@ -2635,6 +2666,7 @@ void D3D12Backend::LatchPackKey(Tex& tx, const TextureDesc& d, const FormatInfo&
     texturedumper::Dump(key, d, p, colours);
     // dumping alone keys the bytes too: the pack image is not drawn then
     tx.pack_key = texturedumper::Replacing() ? key : 0;
+    tx.mark = texture_override::Marks(d, p);
     // the title's own picture comes before the pack's
     if (auto pic = texture_override::Find(d, p, scale_)) {
         tx.swap = OverrideTexture(std::move(pic));
@@ -3244,6 +3276,7 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     FillDepthConstants(s, sh, k, c);
     FillTextureConstants(s, sh, stages, c);
     std::memcpy(c.sun, sun_, sizeof(c.sun));
+    std::memcpy(c.mirror, mirror_, sizeof(c.mirror));
     if (sh.fixed_transform) {
         FillTransformConstants(s, size, c);
         FillLightConstants(s, sh.fk, c);
@@ -3647,6 +3680,9 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     k.sprite = sh.sprite;
     ID3D12PipelineState* pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
     if (!pso) return;
+    // a solid surface with a mirroring texture: drawn again after, with the last frame's picture mirrored in it
+    bool mirror = stages.mirror && !k.blend && k.zen && k.has_rt && k.topo == uint32_t(Topology::Triangles) &&
+                  !sh.quad && !sh.sprite && MirrorReady(s);
     if (ext_) binds_ = {};  // the extension may set anything
     if (pso != binds_.pso) cl_->SetPipelineState(pso);
     binds_.pso = pso;
@@ -3674,6 +3710,168 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     uint32_t query = BeginCountedDraw(s);
     DrawGeometry(a);
     EndCountedDraw(query);
+    if (mirror) DrawMirror(a, sh, k);
+}
+
+// A mirroring draw of the frame's scene (stage 0's texture marked, bound_rt_ and bound_ds_ its targets): whether it
+// gets its second draw. The frame's first such draw says where the view lies in the target (the title's Reflections
+// call comes before the scene has set its viewport) and fills the constants; the answer holds for the frame.
+// It takes the last frame's view, the copies made of that frame and the same viewport in both.
+bool D3D12Backend::MirrorReady(const State& s) {
+    MirrorView& now = mirror_v_[0];
+    if (now.sent != presents_ || mirror_failed_ || ext_) return false;
+    Target* rt = bound_rt_;
+    if (!rt || !bound_ds_ || rt->gw != guest_w_ || rt->gh != guest_h_) return false;
+    mirror_seen_ = presents_;
+    if (now.placed) return mirror_ok_;
+    const Viewport& v = s.viewport;
+    float sc = float(rt->w) / float(rt->gw);
+    float x0 = std::clamp(std::floor(float(v.x) * sc), 0.0f, float(rt->w));
+    float y0 = std::clamp(std::floor(float(v.y) * sc), 0.0f, float(rt->h));
+    float x1 = std::clamp(std::floor(float(v.x + v.w) * sc), 0.0f, float(rt->w));
+    float y1 = std::clamp(std::floor(float(v.y + v.h) * sc), 0.0f, float(rt->h));
+    if (x1 <= x0 || y1 <= y0 || v.max_z <= v.min_z) return false;
+    const float* p = now.p;
+    float zr = v.max_z - v.min_z;
+    now.vp[0] = x0, now.vp[1] = y0, now.vp[2] = x1 - x0, now.vp[3] = y1 - y0;
+    // (as Occlusion: the title's depth is 1 - the stored one)
+    now.zp[0] = p[4] * zr;
+    now.zp[1] = float(1.0 - (double(v.min_z) + double(p[5]) * double(zr)));
+    now.placed = true;
+    mirror_ok_ = false;
+    const MirrorView& was = mirror_v_[1];
+    bool last = was.placed && was.sent + 1 == presents_ && !std::memcmp(was.vp, now.vp, sizeof(now.vp));
+    bool copies = mirror_c_ && mirror_z_ && mirror_kept_ + 1 == presents_ && mirror_w_ == rt->w && mirror_h_ == rt->h &&
+                  mirror_fmt_ == rt->fmt;
+    if (!last || !copies) return false;
+    if (!mirror_ps_) {
+        mirror_ps_ = Compile(MirrorHlsl(), "main", "ps_5_0", mirror_ph_);
+        if (!mirror_ps_) {
+            mirror_failed_ = true;
+            LOGE("d3d12: the reflections' shader did not compile: surfaces are drawn without");
+            return false;
+        }
+        LOGR("d3d12: reflections on, from the last frame's picture, %ux%u", rt->w, rt->h);
+    }
+    // the view matrices' rows (the world's axes in view space) and places
+    const float* a = p + 8;
+    const float* b = was.p + 8;
+    const float* t = p + 17;
+    const float* u = was.p + 17;
+    float (*m)[4] = mirror_;
+    for (int i = 0; i < 4; i++) m[0][i] = p[i], m[2][i] = was.p[i];
+    m[1][0] = now.zp[0], m[1][1] = now.zp[1], m[1][2] = p[6], m[1][3] = p[7];
+    m[3][0] = was.zp[0], m[3][1] = was.zp[1], m[3][2] = m[3][3] = 0;
+    // this view to the world (the rotation's transpose), the world to the last view
+    for (int j = 0; j < 3; j++) {
+        float place = u[j];
+        for (int c = 0; c < 3; c++) {
+            float e = a[0 + c] * b[0 + j] + a[3 + c] * b[3 + j] + a[6 + c] * b[6 + j];
+            m[4 + j][c] = e;
+            place -= t[c] * e;
+        }
+        m[4 + j][3] = place;
+    }
+    for (int c = 0; c < 3; c++) m[7][c] = a[6 + c];
+    m[7][3] = 0;
+    for (int r = 0; r < 2; r++) {
+        float place = 0;
+        for (int c = 0; c < 3; c++) {
+            m[8 + r][c] = a[r * 3 + c];
+            place -= t[c] * a[r * 3 + c];
+        }
+        m[8 + r][3] = place;
+    }
+    std::memcpy(m[10], now.vp, sizeof(now.vp));
+    mirror_ok_ = true;
+    return true;
+}
+
+// The draw just made, again: the same geometry and vertex shader, the mirror's pixel shader blended over it by its
+// alpha where the surface is the nearest thing (its own depth, drawn a moment ago, passes), writing no depth.
+void D3D12Backend::DrawMirror(const Assembled& a, const DrawShaders& sh, const PsoKey& k) {
+    constexpr uint32_t kSrcAlpha = 0x302, kInvSrcAlpha = 0x303, kAdd = 0x8006;  // as the title's states hold them
+    constexpr uint32_t kLessEqual = 0x203;
+    constexpr uint32_t kColour = 7;  // red, green and blue: the target's alpha stays the surface's
+    PsoKey mk;
+    std::memcpy(&mk, &k, sizeof(mk));
+    mk.ps = mirror_ph_;
+    mk.blend = 1;
+    mk.src = kSrcAlpha;
+    mk.dst = kInvSrcAlpha;
+    mk.op = kAdd;
+    mk.wmask = k.wmask & kColour;
+    mk.zwrite = 0;
+    mk.zfunc = kLessEqual;
+    ID3D12PipelineState* pso = EnsurePipeline(mk, sh.vs_code, mirror_ps_);
+    if (!pso) return;
+    DrawTextures from{};
+    for (int i = 0; i < 4; i++) {
+        from.sv[i].Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        from.sv[i].ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        from.sv[i].Format = kBgra;
+        from.sv[i].Texture2D.MipLevels = 1;
+        from.res[i] = nullptr;
+    }
+    from.res[0] = mirror_c_.Get();
+    from.sv[0].Format = mirror_fmt_;
+    from.res[1] = mirror_z_.Get();
+    from.sv[1].Format = kDepthRead;
+    uint32_t views = EnsureViewSet(from);
+    cl_->SetPipelineState(pso);
+    cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), views, srv_inc_));
+    binds_.pso = pso;
+    binds_.views = views;
+    if (a.index_count) {
+        cl_->DrawIndexedInstanced(a.index_count, 1, 0, a.base_vertex, 0);
+    } else {
+        cl_->DrawInstanced(a.draw_count, 1, 0, 0);
+    }
+}
+
+// a single sample copy of t as it is now, made at t's size when there is none
+bool D3D12Backend::MirrorCopy(Target& t, ComPtr<ID3D12Resource>& copy, D3D12_RESOURCE_STATES& state) {
+    D3D12_RESOURCE_STATES* st;
+    ID3D12Resource* src = Flat(t, st);
+    if (!src) return false;
+    if (!copy) {
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC td = src->GetDesc();
+        td.Alignment = 0;
+        if (!t.depth) td.Flags = D3D12_RESOURCE_FLAG_NONE;
+        state = D3D12_RESOURCE_STATE_COPY_DEST;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, state, nullptr, IID_PPV_ARGS(&copy)))) {
+            return false;
+        }
+    }
+    Transition(src, *st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(copy.Get(), state, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl_->CopyResource(copy.Get(), src);
+    Transition(copy.Get(), state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    return true;
+}
+
+// The world's scene is done (s its targets): its colour and depth are kept for the next frame's mirroring draws, in a
+// frame the title sent Reflections and while such draws were seen in the last half second of frames.
+void D3D12Backend::MirrorKeep(const State& s) {
+    constexpr uint64_t kIdle = 30;
+    if (mirror_v_[0].sent != presents_ || mirror_failed_ || mirror_seen_ == UINT64_MAX || presents_ - mirror_seen_ > kIdle) return;
+    Target* rt = FindTarget(s.rt, false);
+    Target* ds = FindTarget(s.zs, true);
+    if (!rt || !ds || rt->gw != guest_w_ || rt->gh != guest_h_ || ds->w != rt->w || ds->h != rt->h) return;
+    if (mirror_w_ != rt->w || mirror_h_ != rt->h || mirror_fmt_ != rt->fmt) {
+        if (mirror_c_) Release(std::move(mirror_c_));
+        if (mirror_z_) Release(std::move(mirror_z_));
+        mirror_w_ = rt->w;
+        mirror_h_ = rt->h;
+        mirror_fmt_ = rt->fmt;
+    }
+    if (!MirrorCopy(*rt, mirror_c_, mirror_c_state_) || !MirrorCopy(*ds, mirror_z_, mirror_z_state_)) {
+        mirror_failed_ = true;
+        LOGE("d3d12: no copies of the frame for the reflections: surfaces are drawn without");
+        return;
+    }
+    mirror_kept_ = presents_;
 }
 
 // a guest rect scaled to the target and clamped to it
@@ -3907,7 +4105,10 @@ void D3D12Backend::DepthOfFieldStep(const State& s, uint32_t flags) {
     uint32_t draws = dof_draws_;
     dof_draws_ = 0;
     if (dof_stage_ == 0) {
-        if (draws >= kWorldDraws) dof_stage_ = 1;
+        if (draws >= kWorldDraws) {
+            dof_stage_ = 1;
+            MirrorKeep(s);
+        }
         return;
     }
     if (dof_stage_ != 1) return;
@@ -3984,6 +4185,17 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
         if (count == kSunViewRects && rects) {
             std::memcpy(sun_view_, rects, sizeof(sun_view_));
             sun_view_on_ = true;
+        }
+        return;
+    }
+    if (flags & kClearMirror) {
+        if (count == kMirrorRects && rects) {
+            // a new frame's view: the one before becomes the last
+            if (mirror_v_[0].sent != presents_) mirror_v_[1] = mirror_v_[0];
+            mirror_v_[0] = {};
+            std::memcpy(mirror_v_[0].p, rects, sizeof(mirror_v_[0].p));
+            mirror_v_[0].sent = presents_;
+            mirror_ok_ = false;
         }
         return;
     }

@@ -57,4 +57,14 @@ void SunShadows(const SunPicture& p);
 // may lie behind what the picture holds and still be lit.
 void SunOcclusion(const float view_to_sun[12], float keep, float bias);
 
+// the title's thread, once a frame before the scene's world is drawn: surfaces drawn after it with a texture the
+// title marked as mirroring on stage 0 (gpu::texture_override::kMirror; level ones, still water) are drawn a second
+// time with what the last frame's picture held along each pixel's mirrored line of sight, rippled. Nothing else of
+// the surface's draw changes, and a surface drawn blended is left as it is.
+// m: the scene's camera to screen matrix, as Occlusion takes it; view: the world to camera matrix, 16 floats, row
+// vectors (a rotation and a place, the world's up its third row); strength: 1 as worked out, less for less of the
+// mirror; seconds: a clock for the ripples, counted round 64.
+// The first frame, and one whose view the last frame's picture cannot serve, is drawn without.
+void Reflections(const float* m, const float* view, float strength, float seconds);
+
 }  // namespace d3d

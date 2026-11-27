@@ -6,6 +6,7 @@ namespace gpu::texture_override {
 
 namespace {
 std::atomic<Provider> g_provider{nullptr};
+std::atomic<Marker> g_marker{nullptr};
 std::atomic<uint32_t> g_version{1};
 }  // namespace
 
@@ -20,6 +21,17 @@ std::shared_ptr<const Picture> Find(const TextureDesc& d, const uint8_t* guest, 
     auto pic = p(d, guest, render_scale);
     if (pic && (!pic->width || !pic->height || pic->argb.size() != size_t(pic->width) * pic->height)) return nullptr;
     return pic;
+}
+
+void SetMarker(Marker m) {
+    g_marker = m;
+    Changed();
+}
+
+uint8_t Marks(const TextureDesc& d, const uint8_t* guest) {
+    Marker m = g_marker.load();
+    if (!m || !guest || d.cube || d.depth > 1 || d.linear) return 0;
+    return m(d, guest);
 }
 
 void Changed() { g_version.fetch_add(1); }
