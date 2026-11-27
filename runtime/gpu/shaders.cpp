@@ -55,6 +55,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 lt[56];
     float4 rtshift;
     float4 zparams;
+    float4 sun[2];
 };
 )";
 
@@ -431,6 +432,12 @@ std::string TexFetch(const PixelKey& k, int i) {
         std::string rest = F(", %s, %d, i.pos.xy, texsize[%d].xy)", ref.c_str(), t.shadow, i);
         return put(F("shadow(tex%d, smp%d, ", i, i) + uv + rest);
     };
+    auto sun = [&](const std::string& p) {
+        std::string light = (t.flags & kTexSunLight) && i > 0 ? F("t%d", i - 1) : std::string("float4(1, 1, 1, 1)");
+        std::string uv = TexUv(t, i, F("(%s).xy", p.c_str()));
+        return put(F("sunshadow(tex%d, smp%d, %s, %s, %s)", i, i, p.c_str(), uv.c_str(), light.c_str()));
+    };
+    if (t.flags & kTexSun) return mode == 1 ? sun(F("%s.xyz / %s.w", q, q)) : put("float4(0, 0, 0, 1)");
     std::string s;
     switch (mode) {
         // PS_TEXTUREMODES: 1 project2d, 2 project3d, 3 cubemap, 4 passthru, 5 clipplane, 6 and 7 bumpenvmap, 9 dot_st, 0xA dot_zw, 0xD dot_str_3d, 0xE dot_str_cube, 0xF dpndnt_ar, 0x10 dpndnt_gb, 0x11 dotproduct
@@ -491,6 +498,38 @@ float4 spreadtap(Texture2D t, SamplerState s, float2 uv, float4 w, float m) {
             c += float4(saturate(v.rgb * m), v.a);
         }
     return c / (n * n);
+}
+// The shadow picture read by its depth (kTexSun, d3d::SunShadows): p the stage's coordinates over their w, uv where
+// they read the picture. A point is in shadow where the picture holds something nearer its camera: its own depth is
+// sun[0] . (p, 1), 0 at the picture's near plane and 1 at its far one, and the picture holds 1 less that (depth is
+// stored reversed). 3 x 3 gathers 2 texels apart, a box 6 texels across, each texel tested along the receiver's
+// own plane (its slope in depth per uv from the screen derivatives, at most sun[1].w) less the bias sun[1].z.
+// light: the surface's baked light (kTexSunLight), darkened only down to the shade sun[1].y. Handed on as the
+// silhouette picture's alpha (black, alpha the shadow) times sun[1].x.
+float4 sunshadow(Texture2D t, SamplerState s, float3 p, float2 uv, float4 light) {
+    float z = dot(float4(p, 1), sun[0]);
+    float2 ux = ddx(uv), uy = ddy(uv);
+    float zx = ddx(z), zy = ddy(z);
+    if (any(uv <= 0) || any(uv >= 1) || !(z > 0 && z < 1)) return 0;
+    float w, h;
+    t.GetDimensions(w, h);
+    float2 texel = 1 / float2(w, h);
+    float det = ux.x * uy.y - ux.y * uy.x;
+    float2 slope = abs(det) > 1e-24 ? float2(uy.y * zx - ux.y * zy, ux.x * zy - uy.x * zx) / det : 0;
+    slope = clamp(slope, -sun[1].w, sun[1].w);
+    // reversed: lit where the picture holds no more than 1 - (z - bias), a texel's slope taken off for its rounding
+    float ref = 1 - z + sun[1].z + dot(abs(slope), texel);
+    float lit = 0;
+    [unroll] for (int y = -1; y <= 1; y++) {
+        [unroll] for (int x = -1; x <= 1; x++) {
+            float2 o = float2(x, y) * 2 * texel;
+            float4 g = t.GatherRed(s, uv + o);
+            lit += dot(step(g, ref - dot(slope, o)), float4(1, 1, 1, 1));
+        }
+    }
+    float shadow = 1 - lit / 36;
+    if (sun[1].y > 0) shadow *= saturate(1 - sun[1].y / max(dot(light.rgb, float3(1, 1, 1)) / 3, 1e-3));
+    return float4(0, 0, 0, shadow * sun[1].x);
 }
 void alphatest(float a) {
     int f = (int)misc.y;
@@ -936,7 +975,11 @@ std::string PixelHlsl(const PixelKey& k) {
             const TexInfo& t = k.tex[i];
             std::string uv = TexUv(t, i, (k.proj >> i) & 1 ? F("tc%d.xy / tc%d.w", i, i) : F("tc%d.xy", i));
             std::string cube;
-            if (t.shadow)
+            if (t.flags & kTexSun) {
+                std::string light = (t.flags & kTexSunLight) && i > 0 ? F("t%d", i - 1) : std::string("float4(1, 1, 1, 1)");
+                body += F("float4 t%d = sunshadow(tex%d, smp%d, tc%d.xyz / tc%d.w, ", i, i, i, i, i) +
+                        TexUv(t, i, F("tc%d.xy / tc%d.w", i, i)) + ", " + light + ");\n";
+            } else if (t.shadow)
                 body += F("float4 t%d = shadow(tex%d, smp%d, ", i, i, i) + TexUv(t, i, F("tc%d.xy / tc%d.w", i, i)) +
                         F(", tc%d.z / tc%d.w, %d, i.pos.xy, texsize[%d].xy);\n", i, i, t.shadow, i);
             else if (t.kind == kTex2D && (t.flags & kTexWide))

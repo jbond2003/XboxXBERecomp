@@ -14,12 +14,14 @@ struct TexInfo {
     uint8_t kind = kTexNone;
     uint8_t rect = 0;    // linear texture, coordinates in texels
     uint8_t shadow = 0;  // depth texture: 1 D24, 2 D16
-    uint8_t flags = 0;   // kTexWide, kTexTarget, kTexCrisp; bits 0 and 1 are a backend extension's
+    uint8_t flags = 0;   // kTexWide, kTexTarget, kTexCrisp, kTexSun, kTexSunLight; bits 0 and 1 are a backend extension's
 };
 enum : uint8_t {
     kTexWide = 4,    // an upscaled target shrunk by the pass: each tap averaged over console texels
     kTexTarget = 8,  // a render target, read where the console's pixel offset puts it (DrawConstants::rtshift)
     kTexCrisp = 16,  // a target made larger for a silhouette laid on the world (g_boost): its alpha's edge is kept sharp
+    kTexSun = 32,    // that target read by its depth (d3d::SunShadows): sunshadow() in place of its alpha
+    kTexSunLight = 64,  // with kTexSun: the stage before holds the surface's baked light
 };
 
 struct PixelKey {
@@ -106,6 +108,7 @@ struct DrawConstants {
     float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
     float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
     float zparams[4];    // ReversedDepthHlsl: a w buffer's scale (0 for a z buffer), its far w, the polygon offset
+    float sun[2][4];     // kTexSun: d3d::SunShadows' from, then gain, shade, bias, slope
 };
 
 }  // namespace gpu

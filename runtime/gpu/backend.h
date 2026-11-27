@@ -18,8 +18,15 @@ enum : uint32_t {
     // Not a D3DCLEAR value: ambient occlusion over what the target holds now, in order with the draws. The rects are
     // kOcclusionRects of floats in place of ints, as d3d::Occlusion (xdk/d3d8.h) fills them
     kClearOcclusion = 0x100,
+    // Not a D3DCLEAR value: this frame's shadow picture is read by its depth (d3d::SunShadows), kSunRects of floats
+    kClearSun = 0x200,
+    // Not a D3DCLEAR value: where the next d3d::Occlusion's view lies in the shadow picture (d3d::SunOcclusion),
+    // kSunViewRects of floats
+    kClearSunView = 0x400,
 };
 constexpr uint32_t kOcclusionRects = 4;
+constexpr uint32_t kSunRects = 2;
+constexpr uint32_t kSunViewRects = 4;
 
 class Backend {
 public:
@@ -87,6 +94,9 @@ inline std::atomic<bool> g_smaa_off{false};
 // makes it, up to 4096 host pixels: a title's shadow picture laid over more of the world than it was made for
 inline std::atomic<uint32_t> g_boost_size{0};
 inline std::atomic<float> g_boost{1.0f};
+// Set by the renderer while the shadow picture keeps its depth as d3d::SunShadows asks (a depth target made beside
+// it, its shaders compiled): a title puts in the picture what only a depth test can tell apart from what it falls on
+inline std::atomic<bool> g_sun_depth_ok{false};
 
 // F3: save the next frame, every draw and target, under diag::CaptureDir
 inline std::atomic<bool> g_capture{false};

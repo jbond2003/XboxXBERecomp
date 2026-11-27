@@ -37,6 +37,7 @@ struct Target {
     float range = 1;         // colour held divided by it until the extension resolves the target
     uint64_t tag = ~0ull;    // the extension's
     bool boosted = false;    // made larger than the render scale makes it (g_boost)
+    bool sun = false;        // the depth kept beside the shadow picture (d3d::SunShadows)
 };
 
 // what the renderer lends an extension, on the render thread

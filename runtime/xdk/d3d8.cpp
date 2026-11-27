@@ -1546,6 +1546,25 @@ void Occlusion(const float* m, bool gtao, float radius, float strength, const fl
                                                fog_colour[0], fog_colour[1], fog_colour[2], 0};
     g_backend->Clear(g_state, gpu::kOcclusionRects, reinterpret_cast<const uint8_t*>(p), gpu::kClearOcclusion, 0, 0, 0);
 }
+
+// sent as p: the three rows, keep, bias
+void SunOcclusion(const float view_to_sun[12], float keep, float bias) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (!g_backend) return;
+    float p[4 * gpu::kSunViewRects] = {};
+    for (int i = 0; i < 12; i++) p[i] = view_to_sun[i];
+    p[12] = keep;
+    p[13] = bias;
+    g_backend->Clear(g_state, gpu::kSunViewRects, reinterpret_cast<const uint8_t*>(p), gpu::kClearSunView, 0, 0, 0);
+}
+
+// sent as p: from, then gain, shade, bias, slope
+void SunShadows(const float from[4], float gain, float shade, float bias, float slope) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (!g_backend) return;
+    const float p[4 * gpu::kSunRects] = {from[0], from[1], from[2], from[3], gain, shade, bias, slope};
+    g_backend->Clear(g_state, gpu::kSunRects, reinterpret_cast<const uint8_t*>(p), gpu::kClearSun, 0, 0, 0);
+}
 }  // namespace d3d
 
 HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {
