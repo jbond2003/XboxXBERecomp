@@ -76,9 +76,11 @@ struct Water {
     float sky[3];    // the sky's colour
     float glint;     // how bright the sun glints in it, 0 for none
     float sun[3];    // the way to the sun in the world, a unit vector
-    // What fell in it of late: rings spread over the water from each, and froth stands where a grenade or a shell
-    // went in. x, y and z in the world (the rings are drawn on a water within 40 units of that height); w 0 for none,
-    // else the seconds since it fell (under 16) + 16 times its kind: 1 a bullet, 2 a grenade, 3 a shell.
+    // What fell in it of late. The water is pushed down there, waves run out, it is churned white and the spray
+    // speckles it as it falls back: how wide and for how long by the kind. x, y and z in the world (drawn on a water
+    // within 40 units of that height); w 0 for none, else the seconds since it fell (under 16) + 16 times its kind:
+    // 1 a rifle's round, 2 a heavy machine gun's, 3 a cannon's, 4 a small thing fallen in, 5 a large one, 6 a
+    // grenade, 7 a tank's shell, 8 an artillery shell or a bomb.
     float splash[kWaterSplashes][4];
 };
 void Reflections(const float* m, const float* view, float strength, float seconds, const Water* water = nullptr);

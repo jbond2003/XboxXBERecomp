@@ -1112,7 +1112,7 @@ namespace {
 //   [13] the way to the sun in view space
 //   [7] w: with it the dot with (position, 1) is the height in the world
 //   [14] to [25] what fell in the water of late (d3d::Water::splash): its place in the world, w 0 for none or the
-//   seconds since + 16 times its kind
+//   seconds since + 16 times its kind (kFell)
 const char* kMirror = R"(
 Texture2D last : register(t0);
 Texture2D<float> lastz : register(t1);
@@ -1121,11 +1121,13 @@ static const float4 kWave[6] = {
     float4(0.9553, 0.2955, 0.02978, 0.09), float4(0.4536, 0.8912, 0.04161, 0.08), float4(-0.4161, 0.9093, 0.06478, 0.08),
     float4(-0.9041, 0.4274, 0.10300, 0.07), float4(-0.6536, -0.7568, 0.16982, 0.06), float4(0.4685, -0.8835, 0.27318, 0.05)};
 static const float2 kTurn[6] = {float2(0.3, 21), float2(1.7, 24), float2(4.1, 31), float2(2.2, 39), float2(5.0, 49), float2(0.9, 63)};
-// the rings from what fell in a water drawn whole, by kind (none, a bullet, a grenade, a shell): their length, how
-// fast they spread (units a second), how long they last (seconds), their slope; and how wide the froth stands and
-// how long
-static const float4 kRing[4] = {float4(1, 0, 1, 0), float4(10, 45, 2.5, 0.35), float4(26, 70, 4, 0.5), float4(70, 140, 7, 0.8)};
-static const float2 kFroth[4] = {float2(1, 1), float2(1, 1), float2(45, 2), float2(150, 3.5)};
+// What fell in a water drawn whole, by kind, each measured from the title's own effect for it (none; a rifle's round,
+// a heavy gun's, a cannon's; a small thing fallen in, a large one; a grenade, a tank's shell, an artillery shell):
+// how far round the place the water is thrown up and churned white (units), how long the white stays (seconds), how
+// long its waves run (seconds), and how long its spray takes to fall back (seconds)
+static const float4 kFell[9] = {
+    float4(1, 1, 1, 1), float4(20, 1.2, 3, 0.5), float4(40, 1.5, 3.5, 0.6), float4(90, 2, 4.5, 1.0), float4(60, 3, 4.5, 0.8),
+    float4(120, 3.5, 5.5, 1.0), float4(80, 3.5, 5, 1.2), float4(150, 4.5, 6.5, 1.6), float4(300, 7, 10, 2.5)};
 // a water drawn whole: its waves from a long swell to fine chop, most of them with the wind, in the same terms
 static const float4 kSea[22] = {
     float4(0.6598, 0.7514, 0.00624, 0.0263), float4(0.9987, 0.0504, 0.00743, 0.0263), float4(0.9251, -0.3797, 0.01102, 0.0375),
@@ -1261,7 +1263,7 @@ float4 main(VOut i) : SV_Target {
     float2 slope = float2(0, 0);
     float sea = mirror[11].w;
     float crest = 0;
-    float froth = 0;
+    float churn = 0;
     if (sea > 0) {
         for (int j = 0; j < 22; j++) {
             float len = 6.2831853 / kSea[j].z;
@@ -1270,26 +1272,57 @@ float4 main(VOut i) : SV_Target {
             slope += kSea[j].xy * (cos(arg) * a);
             crest += sin(arg) * a;
         }
-        // Rings from what fell in it: a packet of waves round each place, its front spreading and widening, dying
-        // with its age and with the way from the place; froth where a grenade or a shell went in, for a few
-        // seconds. Only on a water at the height of the place.
+        // What fell in it (the title's own splash stands over this, drawn after). Round each place, by its kind's
+        // measure: a hollow where it went in, its rim running out in the first moments; the water churned white
+        // out to that measure, breaking up into patches and clearing as it ages; the spray falling back as specks
+        // over a wider round; and a packet of waves as long as the splash is large, its front spreading and
+        // widening, a line of foam on its first crest. Only on a water at the height of the place.
         float level = dot(P, mirror[7].xyz) + mirror[7].w;
         for (int e = 0; e < 12; e++) {
             float4 fell = mirror[14 + e];
-            if (fell.w > 0 && abs(level - fell.z) < 40) {
-                int kind = int(min(fell.w / 16, 3.5));
+            [branch] if (fell.w > 0 && abs(level - fell.z) < 40) {
+                int kind = int(min(fell.w / 16, 8.5));
                 float age = fell.w - kind * 16;
-                float4 ring = kRing[kind];
+                float4 size = kFell[kind];
+                float wide = size.x;
                 float2 off = place - fell.xy;
                 float r = length(off);
-                float front = ring.y * age;
-                float fade = saturate(1 - age / ring.z);
-                float x = (r - front) / (ring.x * 2 + front * 0.3);
-                float env = exp(-x * x) * fade * saturate(ring.x / (foot * 3) - 0.5) / sqrt(1 + r / (ring.x * 4));
-                float turn = (r - front) * 6.2831853 / ring.x;
-                slope += off / max(r, 0.001) * (cos(turn) * env * ring.w);
-                crest += sin(turn) * env * ring.w * 0.5;
-                if (kind >= 2) froth = max(froth, saturate(1 - r / kFroth[kind].x) * saturate(1 - age / kFroth[kind].y));
+                float2 out_way = off / max(r, 0.001);
+                // the churned water
+                float u = saturate(age / size.y);
+                float grown = wide * (1 - exp(-age * 6 / size.y)) * (1 + 0.35 * u);
+                float2 q = off * (9 / wide);
+                float lace = 0.5 + 0.5 * sin(q.x + 1.7 * sin(q.y * 1.3 + fell.x)) * sin(q.y * 1.1 + 1.9 * sin(q.x * 0.9 + fell.y));
+                float cover = saturate((grown * (0.8 + 0.4 * lace) - r) / (wide * 0.22 + 1));
+                float white = saturate(cover * (1.5 - 1.1 * u) - lace * (0.2 + 1.2 * u)) * step(age, size.y);
+                // the waves, from its edge
+                float len = max(wide * 0.45, 14);
+                float front = grown * 0.7 + (10 * sqrt(len) + 20) * age;
+                float fade = saturate(1 - age / size.z) * saturate(age * 3);
+                float fine = saturate(len / (foot * 3) - 0.5);
+                float x = (r - front) / (len * 2 + front * 0.2);
+                float env = exp(-x * x) * fade * fine / sqrt(1 + r / (len * 6));
+                // (not the same all the way round)
+                env *= 0.7 + 0.3 * sin(dot(out_way, float2(3.1, 1.7)) * 2.3 + fell.x);
+                float steep = min(0.3 + wide / 350, 0.8);
+                float turn = (r - front) * 6.2831853 / len;
+                slope += out_way * (cos(turn) * env * steep);
+                crest += sin(turn) * env * steep * 0.5;
+                float rim = (r - front - len * 0.25) / (len * 0.2);
+                white = max(white, exp(-rim * rim) * fade * fade * fine * (0.25 + 0.6 * lace));
+                // the hollow
+                float y = r / (wide * (0.25 + 0.75 * saturate(age * 4)));
+                slope += out_way * (y * exp(-y * y) * saturate(1 - age / (0.5 + wide / 200)) * 1.6 * saturate(wide / (foot * 4) - 0.3));
+                // the spray falling back
+                float falls = saturate(age / 0.3) * saturate(2 - age / size.w) * saturate(1.6 - r / wide);
+                float cell = max(wide / 16, 3);
+                float2 box = floor(off / cell);
+                float h = frac(sin(dot(box, float2(12.9898, 78.233)) + floor(age * 12) * 37.719) * 43758.5453);
+                float2 drop = off / cell - box - 0.5 - (float2(frac(h * 57.31), frac(h * 113.7)) - 0.5) * 0.5;
+                float sharp = saturate(cell / foot * 0.25 - 0.5);
+                float speck = h > 1 - 0.35 * falls ? saturate((0.25 - length(drop)) * 8) : 0.0;
+                white = max(white, speck * 0.85 * sharp + falls * 0.12 * (1 - sharp));
+                churn = max(churn, white);
             }
         }
     } else {
@@ -1323,11 +1356,10 @@ float4 main(VOut i) : SV_Target {
     float3 c = body * (1 - fresnel) + seen * min(fresnel, 0.85);
     // the sun's glint, where the mirrored line goes to it
     c += float3(1.0, 0.97, 0.9) * (pow(saturate(dot(R, mirror[13].xyz)), 260) * mirror[12].w);
-    // foam where a shore or a hull rises through it: whole at the edge, in patches by the waves further out; none
-    // where the rings round a pixel are finer than the pixels
-    // and the froth of what fell in
-    // (none where neither is near: the waves' crests alone make no foam)
-    float foam = saturate(froth * 1.8 - 0.3 + crest * 2.5) * saturate(froth * 6);
+    // white where what fell in churned it; and foam where a shore or a hull rises through it: whole at the edge, in
+    // patches by the waves further out, none where the rings round a pixel are finer than the pixels (and none where
+    // no shore is near: the waves' crests alone make no foam)
+    float foam = churn;
     if (mirror[3].z > 0.5) {
         float shore = MirrorShore(P, N) * saturate(2 - foot * 6 / kFoam);
         foam = max(foam, saturate(shore * 1.3 - 0.45 + crest * 2.5) * saturate(shore * 6));
